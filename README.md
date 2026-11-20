@@ -51,9 +51,9 @@ python3 -B fp8miner.py mine --preset testnet2 \
   --work-dir runs --attempts 1
 ```
 
-省略 `--attempts 1` 即可持续挖矿。`gateway_queued` 表示网关已排队，出块以节点主链为准。两次 testnet2 solo 测试共完成 481 个任务，**4 个块经节点确认进入主链**。合计扫描平均 95.53 TH/s，计入开证、提交与等待后的全程平均为 55.96 TH/s。
+省略 `--attempts 1` 即可持续挖矿。`gateway_queued` 表示网关已排队，出块以节点主链为准。两次 testnet2 solo 测试共完成 481 个任务，**4 个块经节点确认进入主链**。合计扫描平均 95.53 TH/s。
 
-Omit `--attempts 1` to keep mining. `gateway_queued` acknowledges queuing. Check the node for block acceptance. Across two testnet2 solo sessions, 481 completed jobs produced **4 blocks confirmed on the active chain**. The combined scan rate was 95.53 TH/s. Including proof generation, submission and waiting, the sessions averaged 55.96 TH/s. [Testnet2 FP8 激活块 / activation block 150,283](https://blockbook.testnet2.pearlnetwork.net/block/150283)
+Omit `--attempts 1` to keep mining. `gateway_queued` acknowledges queuing. Check the node for block acceptance. Across two testnet2 solo sessions, 481 completed jobs produced **4 blocks confirmed on the active chain**. The combined scan rate was 95.53 TH/s. [Testnet2 FP8 激活块 / activation block 150,283](https://blockbook.testnet2.pearlnetwork.net/block/150283)
 
 ## 自愿打赏 / Optional donations
 
