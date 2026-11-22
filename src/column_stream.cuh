@@ -64,9 +64,6 @@ inline int run(const Options& o,WorkerBufferCache* pool) {
     if(pool){meter=pool->previous_idle_release();pool->match(&layout,meter);}
     CUDA(cudaSetDevice(o.device));
     cudaDeviceProp dev;CUDA(cudaGetDeviceProperties(&dev,o.device));
-    if(std::string(dev.name).find("RTX 5060 Ti")==std::string::npos || dev.major!=12 || dev.minor!=0 ||
-       dev.totalGlobalMem<7000ull*1024*1024 || dev.totalGlobalMem>9000ull*1024*1024)
-        throw std::runtime_error("select an RTX 5060 Ti 8GB (SM120)");
     verified_lt::Plan lt;
     pearl_fused_stream::Plan fused;
     if(vendor){lt.prepare(window_m,window_n,o.k);if(!lt.ready())lt.clear();}

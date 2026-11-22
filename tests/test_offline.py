@@ -88,6 +88,12 @@ class OfflineMinerTest(unittest.TestCase):
         subprocess.run([str(program)], check=True, timeout=30, cwd=self.scratch)
 
     @unittest.skipUnless(shutil.which("c++"), "requires a host C++17 compiler")
+    def test_supported_desktop_models_and_memory(self):
+        subprocess.run(["c++", "-std=c++17", "-fsyntax-only",
+                        str(ROOT / "tests" / "supported_gpu.cpp")],
+                       check=True, timeout=30, cwd=self.scratch)
+
+    @unittest.skipUnless(shutil.which("c++"), "requires a host C++17 compiler")
     def test_deferred_geometry_budget_and_order(self):
         program = self.scratch / ("geometry.exe" if os.name == "nt" else "geometry")
         subprocess.run(["c++", "-std=c++17", "-I", str(ROOT / "src"),

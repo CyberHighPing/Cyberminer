@@ -1,10 +1,10 @@
 #pragma once
-#include "prep_inputs.cuh"
+#include "finite_mix.cuh"
 #include <type_traits>
 namespace left_pack {
 using prep_inputs::Byte;using prep_inputs::Word;using prep_inputs::Row;using prep_inputs::Size;
 using prep_inputs::Digest;using prep_inputs::Side;using prep_inputs::Source;
-using prep_inputs::matrix_transpose;using prep_inputs::load_fragment;using prep_inputs::finish_pair;
+using prep_inputs::matrix_transpose;using prep_inputs::load_fragment;using finite_mix::finish_pair;
 inline int selected(){
     const char* x=std::getenv("PEARL_LEFT_WIDTH");
     if(!x||!std::strcmp(x,"row"))return 0;
@@ -113,7 +113,7 @@ template<int W,bool Staged,bool Vector> __global__ void mix(Byte* output,const B
 }
 template<int W,bool Staged>inline cudaError_t prepare_impl(Byte* output,int rows,int k,std::uint32_t first,
         const pearl_noise::Key& ek,const pearl_noise::Key& fk,const Digest& seed,int batch,
-        Byte* source,size_t source_bytes,Byte* scratch,const Row* meta,Word* invalid,cudaStream_t stream,bool build_f){
+        Byte* source,size_t source_bytes,Byte* scratch,const Row* meta,Word* invalid,cudaStream_t stream,bool build_f,bool source_ready=false){
     auto* f=scratch;auto* e=f+size_t(k)*32;
     cudaError_t err=cudaSuccess;
     if(build_f){err=pearl_noise::generate_table(fk,0,1,0,k,f,stream);if(err!=cudaSuccess)return err;}
@@ -126,15 +126,17 @@ template<int W,bool Staged>inline cudaError_t prepare_impl(Byte* output,int rows
     for(int outer=0;outer<rows;outer+=slab_max){
         const int slab=std::min(rows-outer,slab_max);
         if constexpr(Staged){
-            err=cudaMemcpyAsync(source,output+size_t(outer)*k,size_t(slab)*k,cudaMemcpyDeviceToDevice,stream);
-            if(err!=cudaSuccess)return err;
+            if(!source_ready){
+                err=cudaMemcpyAsync(source,output+size_t(outer)*k,size_t(slab)*k,cudaMemcpyDeviceToDevice,stream);
+                if(err!=cudaSuccess)return err;
+            }
         }
         for(int j=0;j<slab;j+=batch){
             const int count=std::min(batch,slab-j),local=outer+j;
             err=pearl_noise::generate_table(ek,0,0,first+local,count,e,stream);
             if(err!=cudaSuccess)return err;
             const Byte* raw=nullptr;
-            if constexpr(Staged)raw=source+size_t(j)*k;
+            if constexpr(Staged)raw=source+size_t(source_ready?local:j)*k;
             const dim3 grid((k+255)/256,(count+15)/16);
             if(wide)mix<W,Staged,true><<<grid,128,0,stream>>>(output,raw,count,k,Size(first)+local,seed,e,f,meta+local,rows,local);
             else mix<W,Staged,false><<<grid,128,0,stream>>>(output,raw,count,k,Size(first)+local,seed,e,f,meta+local,rows,local);
@@ -145,7 +147,7 @@ template<int W,bool Staged>inline cudaError_t prepare_impl(Byte* output,int rows
 }
 inline cudaError_t prepare(int width,bool use_stage,Byte* output,size_t output_bytes,int rows,int k,std::uint32_t first,
         const pearl_noise::Key& ek,const pearl_noise::Key& fk,const Digest& seed,int batch,Byte* stage,size_t stage_bytes,
-        void* scratch,size_t capacity,const Row* meta,Word* invalid,cudaStream_t stream=nullptr,bool build_f=true){
+        void* scratch,size_t capacity,const Row* meta,Word* invalid,cudaStream_t stream=nullptr,bool build_f=true,bool source_ready=false){
     const auto need=pearl_noise::scratch_bytes(k,batch);
     if(!need||rows<1||rows>=(1<<24)||Size(first)+rows-1>UINT32_MAX||!output||reinterpret_cast<uintptr_t>(output)%4||
        size_t(rows)*k>output_bytes||!scratch||reinterpret_cast<uintptr_t>(scratch)%16||capacity<need||
@@ -161,7 +163,7 @@ inline cudaError_t prepare(int width,bool use_stage,Byte* output,size_t output_b
     }
     auto issue=[&](auto w){
         constexpr int W=decltype(w)::value;
-        if(use_stage)return prepare_impl<W,true>(output,rows,k,first,ek,fk,seed,batch,stage,stage_bytes,static_cast<Byte*>(scratch),meta,invalid,stream,build_f);
+        if(use_stage)return prepare_impl<W,true>(output,rows,k,first,ek,fk,seed,batch,stage,stage_bytes,static_cast<Byte*>(scratch),meta,invalid,stream,build_f,source_ready);
         return prepare_impl<W,false>(output,rows,k,first,ek,fk,seed,batch,nullptr,0,static_cast<Byte*>(scratch),meta,invalid,stream,build_f);
     };
     switch(width){case 128:return issue(std::integral_constant<int,128>{});case 256:return issue(std::integral_constant<int,256>{});

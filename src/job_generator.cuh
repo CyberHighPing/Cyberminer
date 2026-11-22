@@ -103,6 +103,20 @@ PJ_INLINE Word triangular_pair(Word random) {
 }
 } // namespace detail
 
+#ifdef PEARL_SCAN_INPUTS
+// Each resulting byte is (two seven-bit samples + 1) xor 0x80.
+// The largest pre-XOR value is 255, so adjacent byte sums cannot carry.
+PJ_INLINE Word pack_samples(Word a, Word b) {
+#ifdef __CUDA_ARCH__
+    const Word even=__byte_perm(a,b,0x6420), odd=__byte_perm(a,b,0x7531);
+#else
+    const Word even=(a&255u)|((a>>8)&0xff00u)|((b&255u)<<16)|((b&0xff0000u)<<8);
+    const Word odd=((a>>8)&255u)|((a>>16)&0xff00u)|((b&0xff00u)<<8)|(b&0xff000000u);
+#endif
+    return ((even&0x7f7f7f7fu)+(odd&0x7f7f7f7fu)+0x01010101u)^0x80808080u;
+}
+
+#endif  // PEARL_SCAN_INPUTS
 // One XOF output block covers precisely 32 dense values. No generator state
 // is shared between blocks or between independent A/B labels.
 PJ_INLINE void raw_block(const Digest& seed, Side side,Size index,Word* out8) {
@@ -116,9 +130,68 @@ PJ_INLINE void raw_block(const Digest& seed, Side side,Size index,Word* out8) {
 #pragma unroll
 #endif
     for(unsigned i=0;i<8;++i)
+#ifdef PEARL_SCAN_INPUTS
+        out8[i]=pack_samples(x[2*i],x[2*i+1]);
+#else  // PEARL_SCAN_INPUTS
         out8[i]=detail::triangular_pair(x[2*i])|(detail::triangular_pair(x[2*i+1])<<16);
+#endif  // PEARL_SCAN_INPUTS
 }
 
+#ifdef PEARL_SCAN_INPUTS
+// For one generator key, side and 32 high counter bits, columns 1..3 of
+// the first BLAKE3 round are identical at every output block. Two diagonal
+// half-round prefixes also have no dependency on the varying low counter.
+struct RawPrefix { Word state[16]; Word counter_high; };
+PJ_INLINE RawPrefix raw_prefix(const Digest& seed,Side side,Word counter_high=0) {
+    RawPrefix p{{seed.words[0],seed.words[1],seed.words[2],seed.words[3],
+                 seed.words[4],seed.words[5],seed.words[6],seed.words[7],
+                 0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
+                 0,counter_high,25,27},counter_high};
+    auto* v=p.state;
+    detail::g(v[1],v[5],v[9],v[13],detail::le4('6','0','/','d'),detail::le4('e','n','s','e'));
+    detail::g(v[2],v[6],v[10],v[14],detail::le4('-','x','o','f'),detail::le4('/','v','2','/'));
+    detail::g(v[3],v[7],v[11],v[15],Word(static_cast<unsigned char>(side)),0);
+    v[0]+=v[4]+detail::le4('p','e','a','r');
+    v[1]+=v[6];
+    v[2]+=v[7];
+    v[13]=detail::rotr<16>(v[13]^v[2]);
+    return p;
+}
+
+PJ_INLINE void raw_after_rotation(Word& a,Word& b,Word& c,Word& d,Word y) {
+    c+=d;b=detail::rotr<12>(b^c);
+    a+=b+y;d=detail::rotr<8>(d^a);c+=d;b=detail::rotr<7>(b^c);
+}
+
+PJ_INLINE void raw_from_matching_prefix(const Digest& seed,Side side,const RawPrefix& prefix,Size counter,Word* out) {
+    const Word msg[16]={detail::le4('p','e','a','r'),detail::le4('l','-','5','0'),
+        detail::le4('6','0','/','d'),detail::le4('e','n','s','e'),detail::le4('-','x','o','f'),
+        detail::le4('/','v','2','/'),Word(static_cast<unsigned char>(side)),0,0,0,0,0,0,0,0,0};
+    Word v[16];
+#ifdef __CUDACC__
+#pragma unroll
+#endif
+    for(unsigned j=0;j<16;++j)v[j]=prefix.state[j];
+    v[12]=detail::rotr<16>(Word(counter)^v[0]);
+    raw_after_rotation(v[0],v[4],v[8],v[12],msg[1]);
+    detail::g(v[0],v[5],v[10],v[15],0,0);
+    v[12]=detail::rotr<16>(v[12]^v[1]);
+    raw_after_rotation(v[1],v[6],v[11],v[12],0);
+    raw_after_rotation(v[2],v[7],v[8],v[13],0);
+    detail::g(v[3],v[4],v[9],v[14],0,0);
+    detail::round<1>(v,msg);detail::round<2>(v,msg);detail::round<3>(v,msg);
+    detail::round<4>(v,msg);detail::round<5>(v,msg);detail::round<6>(v,msg);
+#ifdef __CUDACC__
+#pragma unroll
+#endif
+    for(unsigned i=0;i<4;++i) {
+        const unsigned j=2*i;
+        out[i]=pack_samples(v[j]^v[j+8],v[j+1]^v[j+9]);
+        out[4+i]=pack_samples(v[j+8]^seed.words[j],v[j+9]^seed.words[j+1]);
+    }
+}
+
+#endif  // PEARL_SCAN_INPUTS
 template<bool Scales>
 PJ_INLINE void load_plane_block(const std::uint8_t* raw,Size offset,Size size,Word* msg) {
     const Size available=offset<size?size-offset:0;
@@ -225,9 +298,12 @@ static __global__ void operand_kernel(Roots* out,Digest key) {
 }
 template<bool Scales>
 inline cudaError_t tree(const std::uint8_t* raw,Size size,Size count,const Digest& key,
-                        Digest* a,Digest* b,Digest* root,cudaStream_t stream) {
+                        Digest* a,Digest* b,Digest* root,cudaStream_t stream,
+                        Digest* host_cut=nullptr,Size cut_count=0) {
     leaf_kernel<Scales><<<blocks(count),threads,0,stream>>>(raw,size,count,key,count==1?root:a);
     auto err=cudaGetLastError();
+    if(err==cudaSuccess && host_cut && count==cut_count)
+        err=cudaMemcpyAsync(host_cut,count==1?root:a,count*sizeof(Digest),cudaMemcpyDeviceToHost,stream);
     if(err!=cudaSuccess || count==1) return err;
     while(count>1) {
         const Size next=(count+1)/2;
@@ -236,6 +312,10 @@ inline cudaError_t tree(const std::uint8_t* raw,Size size,Size count,const Diges
         err=cudaGetLastError();
         if(err!=cudaSuccess) return err;
         b=a;a=dst;count=next;
+        if(host_cut && count==cut_count) {
+            err=cudaMemcpyAsync(host_cut,a,count*sizeof(Digest),cudaMemcpyDeviceToHost,stream);
+            if(err!=cudaSuccess)return err;
+        }
     }
     return cudaSuccess;
 }

@@ -71,7 +71,22 @@ template<int L,int W> __device__ __forceinline__ void retire_stage(const CUtenso
     }
 }
 
-template<int L,int W,int Order=0,int Fold=0> __global__ __launch_bounds__(256,1) void scan_window(const __grid_constant__ CUtensorMap a,
+template<bool Active>
+__device__ __forceinline__ void scaled_multiply32(float (&d)[4],const Word (&a)[4],const Word (&b)[2]){
+    if constexpr(!Active){
+        multiply32(d,a,b);
+    }else{
+        constexpr Word alpha=0xfeu, beta=0x0u;
+        constexpr unsigned short zero=0,select_a=0,select_b=0;
+        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+                     "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},{%14},{%18,%15},{%16},{%17,%15};"
+                     :"=f"(d[0]),"=f"(d[1]),"=f"(d[2]),"=f"(d[3])
+                     :"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1]),
+                      "f"(d[0]),"f"(d[1]),"f"(d[2]),"f"(d[3]),"r"(alpha),"h"(zero),"r"(beta),"h"(select_b),"h"(select_a));
+    }
+}
+
+template<int L,int W,int Order=0,int Fold=0,bool PairColumns=false> __global__ __launch_bounds__(256,1) void scan_window(const __grid_constant__ CUtensorMap a,
         const __grid_constant__ CUtensorMap b,Word* output,int m,int n,int k,int fold_cols,const Byte* panel_b){
     extern __shared__ __align__(1024) Byte ring[];
     __shared__ __align__(8) std::uint64_t ready[stages],empty[stages];
@@ -87,7 +102,16 @@ template<int L,int W,int Order=0,int Fold=0> __global__ __launch_bounds__(256,1)
     const int local=id-first*grid_n,height=grid_m-first<strip_height?grid_m-first:strip_height;
     row0=(first+local%height)*tile_m;col0=(local/height)*tile_n;
     }else if constexpr(Order==1){
-        row0=int(blockIdx.x)*tile_m;col0=int(blockIdx.y)*tile_n;
+        int row=blockIdx.x,col=blockIdx.y;
+        if constexpr(PairColumns){
+            // In each adjacent column pair, issue even and odd columns in turn.
+            // An unpaired final column keeps its original row order.
+            if((col|1)<int(gridDim.y)){
+                const int index=(col&1)*int(gridDim.x)+row;
+                row=index>>1;col=(col&~1)+(index&1);
+            }
+        }
+        row0=row*tile_m;col0=col*tile_n;
     }else{
         const int group_m=m/tile_m;
         const int group_n=int(gridDim.x)/group_m;
@@ -118,14 +142,53 @@ template<int L,int W,int Order=0,int Fold=0> __global__ __launch_bounds__(256,1)
                 if(q==1&&j==10)retire_stage<L,W>(a,b,ring,ready,empty,slot,epoch,step,steps,row0,col0,panel_b,k);
 #pragma unroll
                 for(int i=0;i<4;i++){
-                    multiply32(accum[i][j],av[i],bp[0]);
-                    multiply32(accum[i][j+1],av[i],bp[1]);
+                    scaled_multiply32<(Fold==2 && Order==1 && L==128 && W==256)>(accum[i][j],av[i],bp[0]);
+                    scaled_multiply32<(Fold==2 && Order==1 && L==128 && W==256)>(accum[i][j+1],av[i],bp[1]);
                 }
             }
         }
         if(++slot==stages){slot=0;epoch^=1;}
     }
-    if constexpr(Fold==2){
+    if constexpr(Fold==2 && Order==1 && L==128 && W==256){
+    const int half=(lane>>1)&1,segment=lane&1;
+    constexpr int wave=3;
+#pragma unroll
+    for(int start=0;start<6;start+=wave){
+        Word words[wave]={};
+#pragma unroll
+        for(int q=0;q<4;q++){
+            Word lo[wave][4],hi[wave][4];
+#pragma unroll
+            for(int g=0;g<wave;g++){
+                const int ticket=start+g;
+#pragma unroll
+                for(int t=0;t<4;t++){
+                    const int row=ticket<4?ticket:2*(ticket-4)+(t&1);
+                    const int fragment=ticket<4?4*(t&1)+q:8+q;
+                    const int part=2*(t/2);
+                    lo[g][t]=__float_as_uint(accum[row][fragment][part]);
+                    hi[g][t]=__float_as_uint(accum[row][fragment][part+1]);
+                }
+                transpose(lo[g],lane);
+                transpose(hi[g],lane);
+            }
+#pragma unroll
+            for(int t=0;t<4;t++){
+#pragma unroll
+                for(int g=0;g<wave;g++)words[g]=fold_step(words[g],lo[g][t]);
+#pragma unroll
+                for(int g=0;g<wave;g++)words[g]=fold_step(words[g],hi[g][t]);
+            }
+        }
+#pragma unroll
+        for(int g=0;g<wave;g++){
+            const int ticket=start+g;
+            const int row=row0+warp_row+16*(ticket<4?ticket:2*(ticket-4)+segment)+lane/4+8*half;
+            const int col=col0+warp_col+(ticket<4?32*segment:64);
+            if((row/16+1)*16<=m&&col+32<=n)output[(size_t(row/16)*fold_cols+col/32)*16+row%16]=words[g];
+        }
+    }
+    }else if constexpr(Fold==2){
     // Each 96-column warp has two complete tickets in its first 64
     // columns. All four lanes of each quad have distinct owners here.
     const int half=(lane>>1)&1,segment=lane&1;
@@ -227,15 +290,18 @@ inline int selected_grid(){
 }
 class Plan {
     const int grid_=selected_grid();
+    const bool pair_columns_;
     Descriptor left_,right_,tail_right_;
     int k_=0;std::size_t calls_=0;
 public:
+    explicit Plan(bool pair_columns=false):pair_columns_(pair_columns){}
     std::size_t calls()const{return calls_;}
     template<int L,int W,int Fold=0> void run(const Byte* a,const Byte* b,Word* output,int k,int m,int width,int ld,cudaStream_t stream){
         if(!a||!b||!output||!pearl_geometry::supported_scan_depth(k))throw std::invalid_argument("unsupported fused stream input");
         static const Driver api;
         if(!k_){
             if(!grid_)check_cuda(cudaFuncSetAttribute(scan_window<L,W,0,Fold>,cudaFuncAttributeMaxDynamicSharedMemorySize,stages*stage_bytes),"configure stock grid");
+            else if(grid_==1 && pair_columns_)check_cuda(cudaFuncSetAttribute(scan_window<L,W,1,Fold,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,stages*stage_bytes),"configure paired columns");
             else if(grid_==1)check_cuda(cudaFuncSetAttribute(scan_window<L,W,1,Fold>,cudaFuncAttributeMaxDynamicSharedMemorySize,stages*stage_bytes),"configure column grid");
             else check_cuda(cudaFuncSetAttribute(scan_window<L,W,2,Fold>,cudaFuncAttributeMaxDynamicSharedMemorySize,stages*stage_bytes),"configure N-group grid");
             k_=k;
@@ -245,6 +311,7 @@ public:
         if(!grid_||grid_==1){
             right_.bind(api,b,width,k,tile_n,W?W:k);
             if(!grid_)scan_window<L,W,0,Fold><<<gm*gn,256,stages*stage_bytes,stream>>>(left_.map,right_.map,output,m,width,k,ld,b);
+            else if(pair_columns_)scan_window<L,W,1,Fold,true><<<dim3(gm,gn),256,stages*stage_bytes,stream>>>(left_.map,right_.map,output,m,width,k,ld,b);
             else scan_window<L,W,1,Fold><<<dim3(gm,gn),256,stages*stage_bytes,stream>>>(left_.map,right_.map,output,m,width,k,ld,b);
             check_cuda(cudaGetLastError(),"launch full B reuse grid");++calls_;
         }else{

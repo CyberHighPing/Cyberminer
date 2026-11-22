@@ -2,6 +2,7 @@
 #include "job_generator.cuh"
 #include "panel_b.cuh"
 #include <cuda_runtime.h>
+#include "power_limit.hpp"
 #include <openssl/sha.h>
 #include <algorithm>
 #include <array>
@@ -211,6 +212,7 @@ static void publish(const fs::path& out, const Bytes& data) {
     }
     ::unlink(tmp.c_str());
 }
+#include "checkpoint_open.hpp"
 int main(int argc,char** argv) {
     try {
         if (argc==2 && std::string(argv[1])=="--help") {
@@ -236,11 +238,20 @@ int main(int argc,char** argv) {
         require(index<tiles,"tile index out of bounds");
         const auto receipt=read_file(roots,136);
         require(receipt.size()==136 && !std::memcmp(receipt.data(),"PRLNF8R1",8),"invalid scan root receipt");
-        cudaDeviceProp dev{}; gpu(cudaSetDevice(0)); gpu(cudaGetDeviceProperties(&dev,0));
-        require(std::string(dev.name).find("RTX 5060 Ti")!=std::string::npos && dev.major==12 && dev.minor==0 &&
-                dev.totalGlobalMem>=(Size(7000)<<20) && dev.totalGlobalMem<=(Size(9000)<<20),"select a 5060 Ti 8GB");
-        auto a=open_operand(cfg,pearl_jobgen::Side::A,(index/cols)*cfg.h,pearl_jobgen::from_bytes(receipt.data()+8));
-        auto b=open_operand(cfg,pearl_jobgen::Side::B,(index%cols)*cfg.w,pearl_jobgen::from_bytes(receipt.data()+40));
+        const bool from_cut=proof_checkpoints::enabled();
+        proof_checkpoints::Planes cuts;
+        pearl_device::PowerWatch board_guard;
+        if(from_cut)cuts=checkpoint_open::load(roots.string()+".cut",cfg,receipt);
+        else {
+            cudaDeviceProp dev{}; gpu(cudaSetDevice(0)); gpu(cudaGetDeviceProperties(&dev,0));
+            require(pearl_device::supported(dev), std::string(pearl_device::select_message));
+            board_guard.start(*pearl_device::profile_for(dev.name), 0);
+        }
+        auto make_operand=[&](pearl_jobgen::Side side,Size start,const Digest& root) {
+            return from_cut?checkpoint_open::operand(cfg,side,start,root,cuts):open_operand(cfg,side,start,root);
+        };
+        auto a=make_operand(pearl_jobgen::Side::A,(index/cols)*cfg.h,pearl_jobgen::from_bytes(receipt.data()+8));
+        auto b=make_operand(pearl_jobgen::Side::B,(index%cols)*cfg.w,pearl_jobgen::from_bytes(receipt.data()+40));
         Bytes raw,transcript;
         append(transcript,cfg.data.data()+cfg.ancestors+(cfg.depth-1)*108,108);
         append(transcript,&cfg.data[165],19); append(transcript,&cfg.data[156],9);
@@ -254,6 +265,7 @@ int main(int argc,char** argv) {
         const char hex[]="0123456789abcdef"; std::string digest;
         for (Byte v:sha) { digest+=hex[v>>4]; digest+=hex[v&15]; }
         std::cout<<"{\"tile\":"<<index<<",\"proof_bytes\":"<<raw.size()<<",\"proof_sha256\":\""<<digest
+                 <<"\",\"opening_source\":\""<<(from_cut?"scanner_checkpoints":"gpu_rebuild")
                  <<"\",\"b_commit_mode\":\""<<(b.panel?"panel":"whole")<<"\",\"a_gpu_bytes\":"<<a.gpu_bytes
                  <<",\"b_gpu_bytes\":"<<b.gpu_bytes<<",\"peak_explicit_gpu_bytes\":"<<std::max(a.gpu_bytes,b.gpu_bytes)<<"}\n";
         return 0;

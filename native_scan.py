@@ -9,7 +9,7 @@ import subprocess
 
 from cuda_worker import (FAST_STRIP_ROWS, FUSED_STREAM_VARIANT, STREAM_COLS, STREAM_ROWS,
                          STREAM_VARIANTS, abort_on_error, scanner_environment, streamed_variant)
-from lottery import CONTROL_REVISION as PIN, difficulty_bound, labelled, small_digest
+from lottery import CONTROL_REVISION as PIN, difficulty_bound, small_digest
 import sparse_tickets as sparse
 
 CHUNK = 1024
@@ -23,6 +23,8 @@ ROOTS_MAGIC = b"PRLNF8R1"
 CONTROL = struct.Struct("<8s5I32s32s32s32s9s19s32s32sI")
 ROOTS = struct.Struct("<8s32s32s32s32s")
 TAG_PARAMS = struct.Struct("<6I")
+HEADER_KEY_A = small_digest(ROLE+b"key-A")
+HEADER_KEY_B = small_digest(ROLE+b"key-B")
 ROLE_A = small_digest(ROLE+b"seed-A")
 ROLE_B = small_digest(ROLE+b"seed-B")
 
@@ -109,7 +111,8 @@ class Plan:
         return difficulty_bound(self.nbits,h,w,k)
 
     @property
-    def keys(self): return labelled(b"key-A",self.header),labelled(b"key-B",self.ancestors[-1])
+    def keys(self):
+        return small_digest(self.header, HEADER_KEY_A), small_digest(self.ancestors[-1], HEADER_KEY_B)
 
     def prefix(self):
         return (TAG_DOMAIN + bytes.fromhex(PIN) + TAG_PARAMS.pack(4,*self.dims) + self.header
@@ -220,7 +223,7 @@ def check_native_report(report, plan, args, hits):
                 raise ValueError(f"streamed scanner reported inconsistent {rate} for the complete dense work")
         if direct:
             if fast:
-                strip = min(FAST_STRIP_ROWS, m)
+                strip = min(getattr(args, "strip_rows", FAST_STRIP_ROWS), m)
                 strips = (m + strip - 1) // strip
                 edge = n % 192
                 if edge == 64:

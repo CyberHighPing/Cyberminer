@@ -105,18 +105,40 @@ template<bool Generate=true> inline cudaError_t generate_and_measure(Byte* data,
 
 // Each lane computes every raw byte and all sixteen keyed compressions of a
 // 1024-byte leaf. No temporary global-memory plane is required for the first B pass.
-template<int LeafsPerRow,Side operand=Side::B>
+template<int LeafsPerRow,Side operand=Side::B,bool Cache=false>
+#ifdef PEARL_SCAN_INPUTS
+__global__ void direct_b_leaves_kernel(Size leaves,Digest seed,pearl_jobgen::RawPrefix prefix,Digest key,Digest* values,Row* meta,Word* invalid,Byte* raw=nullptr){
+#else  // PEARL_SCAN_INPUTS
 __global__ void direct_b_leaves_kernel(Size leaves,Digest seed,Digest key,Digest* values,Row* meta,Word* invalid){
+#endif  // PEARL_SCAN_INPUTS
     static_assert(LeafsPerRow==8||LeafsPerRow==16||LeafsPerRow==32);
     const Size index=Size(blockIdx.x)*blockDim.x+threadIdx.x;
     const unsigned active=__ballot_sync(0xffffffffu,index<leaves);
     if(index>=leaves)return;
+#ifdef PEARL_SCAN_INPUTS
+    // A 1024-byte leaf is exactly 32 aligned generator counters.
+    // Its lowest and highest counters always have the same upper word.
+    const Word leaf_high=Word(index>>27);
+    if(leaf_high!=prefix.counter_high)prefix=pearl_jobgen::raw_prefix(seed,operand,leaf_high);
+#endif  // PEARL_SCAN_INPUTS
     Digest state=key;int sum=0;Word lane_peaks=0;
 #pragma unroll 1
     for(int b=0;b<16;b++){
         Word msg[16];const Size first=index*32+2*b;
+#ifdef PEARL_SCAN_INPUTS
+        pearl_jobgen::raw_from_matching_prefix(seed,operand,prefix,first,msg);
+        pearl_jobgen::raw_from_matching_prefix(seed,operand,prefix,first+1,msg+8);
+#else  // PEARL_SCAN_INPUTS
         pearl_jobgen::raw_block(seed,operand,first,msg);
         pearl_jobgen::raw_block(seed,operand,first+1,msg+8);
+#endif  // PEARL_SCAN_INPUTS
+#ifdef PEARL_SCAN_INPUTS
+        if constexpr(Cache){
+            auto* dest=reinterpret_cast<uint4*>(raw+index*1024+b*64);
+#pragma unroll
+            for(int j=0;j<4;++j)dest[j]=make_uint4(msg[4*j],msg[4*j+1],msg[4*j+2],msg[4*j+3]);
+        }
+#endif
 #pragma unroll
         for(int j=0;j<16;j++)collect_word(msg[j],sum,lane_peaks);
         const Word flags=16u|(b==0?1u:0u)|(b==15?2u:0u);
@@ -175,15 +197,25 @@ template<Side operand=Side::B> inline cudaError_t direct_b_leaves(const pearl_jo
        (reinterpret_cast<uintptr_t>(cvs)&3)||(reinterpret_cast<uintptr_t>(meta)&3)||(reinterpret_cast<uintptr_t>(invalid)&3)||
        p.value_bytes!=p.value_chunks*1024)return cudaErrorInvalidValue;
     const unsigned blocks=unsigned((p.value_chunks+127)/128);
+#ifdef PEARL_SCAN_INPUTS
+    const auto prefix=pearl_jobgen::raw_prefix(seed,operand);
+    if(p.k==32768)direct_b_leaves_kernel<32,operand><<<blocks,128,0,stream>>>(p.value_chunks,seed,prefix,key,cvs,meta,invalid);
+    else if(p.k==8192)direct_b_leaves_kernel<8,operand><<<blocks,128,0,stream>>>(p.value_chunks,seed,prefix,key,cvs,meta,invalid);
+#else  // PEARL_SCAN_INPUTS
     if(p.k==32768)direct_b_leaves_kernel<32,operand><<<blocks,128,0,stream>>>(p.value_chunks,seed,key,cvs,meta,invalid);
     else if(p.k==8192)direct_b_leaves_kernel<8,operand><<<blocks,128,0,stream>>>(p.value_chunks,seed,key,cvs,meta,invalid);
+#endif  // PEARL_SCAN_INPUTS
     else if(p.k==10240)grouped_b<10,operand>(p,seed,key,cvs,meta,invalid,stream);
     else if(p.k==12288)grouped_b<12,operand>(p,seed,key,cvs,meta,invalid,stream);
     else if(p.k==13312)grouped_b<13,operand>(p,seed,key,cvs,meta,invalid,stream);
     else if(p.k==14336)grouped_b<14,operand>(p,seed,key,cvs,meta,invalid,stream);
     else if(p.k==20480)grouped_b<20,operand>(p,seed,key,cvs,meta,invalid,stream);
     else if(p.k==24576)grouped_b<24,operand>(p,seed,key,cvs,meta,invalid,stream);
+#ifdef PEARL_SCAN_INPUTS
+    else direct_b_leaves_kernel<16,operand><<<blocks,128,0,stream>>>(p.value_chunks,seed,prefix,key,cvs,meta,invalid);
+#else  // PEARL_SCAN_INPUTS
     else direct_b_leaves_kernel<16,operand><<<blocks,128,0,stream>>>(p.value_chunks,seed,key,cvs,meta,invalid);
+#endif  // PEARL_SCAN_INPUTS
     return cudaGetLastError();
 }
 

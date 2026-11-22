@@ -1,7 +1,11 @@
 #pragma once
 #include "job_generator.cuh"
+#include "proof_checkpoints.hpp"
 #ifdef __CUDACC__
 #include "prep_inputs.cuh"
+#ifdef PEARL_SCAN_INPUTS
+#include "leaf13_input.cuh"
+#endif
 #endif
 #include <algorithm>
 #include <cstdlib>
@@ -83,21 +87,47 @@ inline cudaError_t value_leaves(Byte* panel,Size capacity,const Plan& p,const Di
     }
     return cudaSuccess;
 }
-inline cudaError_t commit(Byte* arena,Size capacity,const Plan& p,const Digest& seed,const Digest& key,Roots& host,cudaStream_t stream,prep_inputs::Row* row_params=nullptr,Word* invalid=nullptr,bool inline_leaves=false,pearl_jobgen::Side side=pearl_jobgen::Side::B){
+inline cudaError_t commit(Byte* arena,Size capacity,const Plan& p,const Digest& seed,const Digest& key,Roots& host,cudaStream_t stream,prep_inputs::Row* row_params=nullptr,Word* invalid=nullptr,bool inline_leaves=false,pearl_jobgen::Side side=pearl_jobgen::Side::B,proof_checkpoints::Planes* cuts=nullptr,Byte* raw_output=nullptr){
     if(!pearl_jobgen::valid_plan(p) || !arena || capacity<storage(p))return cudaErrorInvalidValue;
     auto* level=reinterpret_cast<Digest*>(arena+cv_offset(p));auto* next=level+p.value_chunks;
     auto* roots=pearl_jobgen::device_roots(level,p);
     cudaError_t err;
     if(!inline_leaves)err=value_leaves(arena,panel_capacity(p),p,seed,key,level,stream,row_params,invalid,side);
+#ifdef PEARL_SCAN_INPUTS
+    else if(raw_output && side==pearl_jobgen::Side::A && p.k==16384){
+        const auto prefix=pearl_jobgen::raw_prefix(seed,side);
+        prep_inputs::direct_b_leaves_kernel<16,pearl_jobgen::Side::A,true>
+            <<<unsigned((p.value_chunks+127)/128),128,0,stream>>>(p.value_chunks,seed,prefix,key,level,row_params,invalid,raw_output);
+        err=cudaGetLastError();
+    } else if(leaf13::enabled(p.k)){
+        if(side==pearl_jobgen::Side::A)
+            err=leaf13::run<pearl_jobgen::Side::A>(p,seed,key,level,row_params,invalid,stream);
+        else
+            err=leaf13::run<pearl_jobgen::Side::B>(p,seed,key,level,row_params,invalid,stream);
+    }
+#endif
     else if(side==pearl_jobgen::Side::A)err=prep_inputs::direct_b_leaves<pearl_jobgen::Side::A>(p,seed,key,level,row_params,invalid,stream);
     else err=prep_inputs::direct_b_leaves<pearl_jobgen::Side::B>(p,seed,key,level,row_params,invalid,stream);if(err!=cudaSuccess)return err;
+    const unsigned slot=side==pearl_jobgen::Side::A?0:1;
+    if(cuts) {
+        (*cuts)[slot].prepare(p.value_chunks);
+        (*cuts)[slot+2].prepare(p.scale_chunks);
+    }
     auto count=p.value_chunks;Digest* from=level;Digest* to=next;
+    auto save_cut=[&]() {
+        if(!cuts || count!=(*cuts)[slot].nodes.size())return cudaSuccess;
+        return cudaMemcpyAsync((*cuts)[slot].nodes.data(),from,count*sizeof(Digest),cudaMemcpyDeviceToHost,stream);
+    };
+    err=save_cut();if(err!=cudaSuccess)return err;
     while(count>1){const Size n=(count+1)/2;
         detail::parents_kernel<<<detail::blocks(n),detail::threads,0,stream>>>(from,count,key,to);
         err=cudaGetLastError();if(err!=cudaSuccess)return err;std::swap(from,to);count=n;
+        err=save_cut();if(err!=cudaSuccess)return err;
     }
     err=cudaMemcpyAsync(&roots->values,from,sizeof(Digest),cudaMemcpyDeviceToDevice,stream);if(err!=cudaSuccess)return err;
-    err=detail::tree<true>(nullptr,p.scale_bytes,p.scale_chunks,key,level,next,&roots->scales,stream);if(err!=cudaSuccess)return err;
+    err=detail::tree<true>(nullptr,p.scale_bytes,p.scale_chunks,key,level,next,&roots->scales,stream,
+                          cuts?(*cuts)[slot+2].nodes.data():nullptr,cuts?(*cuts)[slot+2].nodes.size():0);
+    if(err!=cudaSuccess)return err;
     detail::operand_kernel<<<1,1,0,stream>>>(roots,key);err=cudaGetLastError();if(err!=cudaSuccess)return err;
     err=cudaMemcpyAsync(&host,roots,sizeof(Roots),cudaMemcpyDeviceToHost,stream);
     return err==cudaSuccess?cudaStreamSynchronize(stream):err;

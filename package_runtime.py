@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent
 PROGRAMS = {"build/pearl-fp8-scan", "build/pearl-fp8-open"}
 LIBRARY = "build/fast_prepare.native.so"
 MEMBERS = sorted(PROGRAMS | {
-    LIBRARY, "LICENSE", "README.md", "THIRD_PARTY.md", "requirements.txt",
+    LIBRARY, "LICENSE", "README.md", "BENCHMARKS.md", "benchmarks.json", "THIRD_PARTY.md", "requirements.txt",
     "licenses/CUTLASS.txt", "licenses/NVIDIA-CUDA.txt", "licenses/Pearl.txt",
     "cuda_worker.py", "fast_prepare.py", "fp8miner.py", "gateway_miner.py", "hashrate.py",
     "gpu_proof.py", "host_math.py", "host_miner.py", "lottery.py",

@@ -19,6 +19,42 @@ from native_scan import Plan, check_headers, check_native_report, synthetic_head
 
 
 class FastScanTest(unittest.TestCase):
+    def test_visible_device_selects_benchmark_geometry(self):
+        ordinary = fp8miner.arguments(["bench"])
+        with patch("fp8miner.subprocess.check_output", return_value="testnet2 1280\n"):
+            fp8miner.resolve_device_preset(ordinary)
+            self.assertEqual(ordinary.strip_rows, fp8miner.RTX_5060_STRIP_ROWS)
+            for command in (["bench"], ["mine", "--socket", "unused"]):
+                standard = fp8miner.arguments([*command, "--preset", "testnet2"])
+                fp8miner.resolve_device_preset(standard)
+                self.assertEqual(standard.strip_rows, fp8miner.RTX_5060_STRIP_ROWS)
+            self.assertEqual((ordinary.preset, ordinary.m, ordinary.n, ordinary.k),
+                             ("testnet2", *TESTNET2_GEOMETRY[:3]))
+            for command in (["bench"], ["mine", "--socket", "unused"]):
+                explicit = fp8miner.arguments([*command, "--preset", "throughput"])
+                with self.assertRaises(fp8miner.UnsupportedPreset):
+                    fp8miner.resolve_device_preset(explicit)
+        ti = fp8miner.arguments(["bench"])
+        with patch("fp8miner.subprocess.check_output", return_value="throughput 1536\n"):
+            fp8miner.resolve_device_preset(ti)
+            self.assertEqual(ti.strip_rows, fp8miner.FAST_STRIP_ROWS)
+        self.assertEqual((ti.preset, ti.m, ti.n, ti.k), ("throughput", *FAST_GEOMETRY[:3]))
+
+    def test_standard_only_profiles_and_board_cap_diagnostics(self):
+        for command in (["bench"], ["mine", "--socket", "unused"]):
+            with patch("fp8miner.subprocess.check_output", return_value="testnet2 1536"):
+                args = fp8miner.arguments([*command, "--preset", "testnet2"])
+                fp8miner.resolve_device_preset(args)
+                self.assertEqual((args.preset, args.strip_rows), ("testnet2", 1536))
+        for raw in ("", "testnet2", "testnet2 13", "other 1536", "testnet2 16384"):
+            with self.subTest(raw=raw), patch("fp8miner.subprocess.check_output", return_value=raw):
+                with self.assertRaises(ValueError):
+                    fp8miner.resolve_device_preset(fp8miner.arguments(["bench"]))
+        failure = subprocess.CalledProcessError(78, ["scanner"])
+        with patch("fp8miner.subprocess.check_output", side_effect=failure):
+            with self.assertRaisesRegex(fp8miner.UnsupportedPreset, "250 W"):
+                fp8miner.resolve_device_preset(fp8miner.arguments(["bench"]))
+
     def test_public_geometry_and_dense_controls(self):
         for command, flags, shape in (
                     ("bench", [], FAST_GEOMETRY),
@@ -175,12 +211,25 @@ class FastScanTest(unittest.TestCase):
             with self.subTest(dims=dims):
                 self.check_right_resident_receipt(dims, strips, launches, windows)
 
-    def check_right_resident_receipt(self, dims, strips, launches, windows):
+    def test_standard_5060_row_strip_controls(self):
+        for strip in (1024, 1536, 2048, 3072, 4096):
+            with self.subTest(strip=strip):
+                count = (TESTNET2_GEOMETRY[0]+strip-1)//strip
+                self.check_right_resident_receipt(TESTNET2_GEOMETRY, count, 2*count, 256, strip)
+        for invalid in (0, True, 255, 500, 8448):
+            args = fp8miner.arguments(["bench", "--preset", "testnet2"])
+            args.strip_rows = invalid
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                scanner_environment(args)
+
+    def check_right_resident_receipt(self, dims, strips, launches, windows, strip=1536):
         m,n,k,h,w = dims
         args = fp8miner.arguments(["bench","--quick"])
         header, chain = synthetic_headers(0x18010000)
         plan = Plan((m,n,k,h,w), bytes(range(32)), header, tuple(chain))
-        macs=m*n*k; strip=1536; folds=(strip//h)*(n//w)*16*4
+        args.strip_rows = strip
+        self.assertEqual(scanner_environment(args)["PEARL_ROW_STRIP"], str(strip))
+        macs=m*n*k; folds=(strip//h)*(n//w)*16*4
         arena=n*k+strip*k+folds
         row=dict(mode="native_job",m=m,n=n,k=k,tile_h=h,tile_w=w,variant=args.variant,
                  streamed_a=True,streamed_b=False,resident_operands=False,resident_operand="B",

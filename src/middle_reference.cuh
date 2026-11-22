@@ -9,8 +9,6 @@ inline int run(const Options& o) {
         throw std::invalid_argument("reference needs canonical aligned native dense jobs");
     CUDA(cudaSetDevice(o.device));
     cudaDeviceProp dev{};CUDA(cudaGetDeviceProperties(&dev,o.device));
-    if(std::string(dev.name).find("5060 Ti")==std::string::npos||dev.major!=12||dev.minor!=0||dev.totalGlobalMem<7000ull<<20||dev.totalGlobalMem>9000ull<<20)
-        throw std::runtime_error("select the RTX 5060 Ti 8 GB");
     using Byte=std::uint8_t;using Word=std::uint32_t;using Side=pearl_jobgen::Side;
     const auto start=Clock::now();
     native_inputs::Plan job(o.native_job,o.m,o.n,o.k,o.h,o.w);

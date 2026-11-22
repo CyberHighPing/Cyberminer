@@ -1,0 +1,304 @@
+{
+  "release_version": "v0.2.0",
+  "builds": [
+    {
+      "edition": "desktop",
+      "cli_version": "v0.2.0",
+      "measured_version": "v0.1.2-dev.3"
+    },
+    {
+      "edition": "5060Ti-r10.3",
+      "cli_version": "v0.2.0+r10.3",
+      "measured_version": "v0.1.1-dev.2+r10.3"
+    },
+    {
+      "edition": "Spark-gb10.2",
+      "cli_version": "v0.2.0+gb10.2",
+      "measured_version": "v0.1.2-dev.3-gb10.2"
+    }
+  ],
+  "network": "Pearl testnet2",
+  "certificate_version": 4,
+  "metric": "Completed dense MACs / scan wall seconds / 1e12. One MAC counts once.",
+  "units": {
+    "th_s": "trillion dense MACs per second",
+    "j_per_tmac": "device joules per trillion dense MACs"
+  },
+  "commercial_pool_accepted_th_s": null,
+  "presets_m_n_k": {
+    "testnet2": [
+      131072,
+      131072,
+      16384
+    ],
+    "throughput": [
+      1044480,
+      540672,
+      13312
+    ]
+  },
+  "desktop_standard_paired": {
+    "baseline_version": "v0.1.2-dev.2",
+    "selected_version": "v0.1.2-dev.3",
+    "cards": [
+      {
+        "gpu": "RTX 5060",
+        "board_limit_w": 145,
+        "core_offset_mhz": 0,
+        "paired_seeds": 40,
+        "baseline": {
+          "th_s": 73.19169,
+          "watts": 144.8741,
+          "j_per_tmac": 1.979379
+        },
+        "selected": {
+          "th_s": 73.31939,
+          "watts": 144.9759,
+          "j_per_tmac": 1.97732
+        },
+        "paired_delta_ci95_th_s": [
+          0.067,
+          0.18824
+        ],
+        "measured_memory_mhz": 13801
+      },
+      {
+        "gpu": "RTX 5060 Ti 8 GB",
+        "board_limit_w": 180,
+        "core_offset_mhz": 250,
+        "paired_seeds": 40,
+        "baseline": {
+          "th_s": 98.94983,
+          "watts": 179.8995,
+          "j_per_tmac": 1.818088
+        },
+        "selected": {
+          "th_s": 99.06359,
+          "watts": 179.8424,
+          "j_per_tmac": 1.815423
+        },
+        "paired_delta_ci95_th_s": [
+          0.05945,
+          0.16818
+        ],
+        "measured_memory_mhz": 13801
+      },
+      {
+        "gpu": "RTX 5070",
+        "board_limit_w": 175,
+        "core_offset_mhz": 490,
+        "paired_seeds": 24,
+        "baseline": {
+          "th_s": 119.030699,
+          "watts": 174.579592,
+          "j_per_tmac": 1.467218
+        },
+        "selected": {
+          "th_s": 119.218036,
+          "watts": 175.21112,
+          "j_per_tmac": 1.470169
+        },
+        "paired_delta_ci95_th_s": [
+          0.128787,
+          0.245927
+        ]
+      },
+      {
+        "gpu": "RTX 5080",
+        "board_limit_w": 250,
+        "core_offset_mhz": 0,
+        "paired_seeds": 24,
+        "core_ceiling_mhz": 2400,
+        "baseline": {
+          "th_s": 174.709222,
+          "watts": 247.04285,
+          "j_per_tmac": 1.415003
+        },
+        "selected": {
+          "th_s": 177.815634,
+          "watts": 251.445275,
+          "j_per_tmac": 1.41499
+        },
+        "paired_delta_ci95_th_s": [
+          2.551057,
+          3.658798
+        ]
+      }
+    ]
+  },
+  "rtx_5060_ti_historical": {
+    "version": "v0.1.1-dev.2+r10.3",
+    "compared_with": "v0.1.1-dev.2",
+    "board_limit_w": 180,
+    "core_offset_mhz": 250,
+    "memory_mhz": 7001,
+    "throughput": {
+      "paired_seeds": 2,
+      "baseline": {
+        "scan_seconds": 149.830339,
+        "th_s": 100.347729
+      },
+      "r10_3": {
+        "scan_seconds": 149.10034,
+        "th_s": 100.839035
+      },
+      "r10_3_individual_th_s": [
+        100.862312,
+        100.815768
+      ]
+    },
+    "testnet2": {
+      "paired_seeds": 24,
+      "baseline": {
+        "scan_seconds": 68.565069,
+        "th_s": 98.52538
+      },
+      "r10_3": {
+        "scan_seconds": 68.246763,
+        "th_s": 98.984906
+      }
+    }
+  },
+  "rtx_5060_ti_large_retest": {
+    "paired_seeds": 2,
+    "board_limit_w": 180,
+    "core_offset_mhz": 250,
+    "memory_mhz": 7001,
+    "r10_3_th_s": 100.245257,
+    "desktop_dev3_th_s": 100.229333,
+    "identical_tickets_and_merkle_openings": true
+  },
+  "rtx_5070_ti_standard": {
+    "version": "v0.1.2-dev.3",
+    "board_limit_w": 300,
+    "core_offset_mhz": 0,
+    "window_scans": [
+      64,
+      64,
+      64
+    ],
+    "window_th_s": [
+      139.023372,
+      155.580635,
+      150.517199
+    ],
+    "combined_th_s": 148.04339,
+    "eight_scan_batches_at_160": 0,
+    "eight_scan_batches": 24
+  },
+  "gb10_standard": {
+    "baseline_version": "v0.1.2-dev.3-gb10.1",
+    "version": "v0.1.2-dev.3-gb10.2",
+    "paired_seeds": 24,
+    "requested_core_mhz": 1430,
+    "paired_delta_ci95_th_s": [
+      7.492976,
+      9.28992
+    ],
+    "baseline": {
+      "strip_rows": 1536,
+      "th_s": 56.39854,
+      "watts": 34.97239,
+      "j_per_tmac": 0.620094,
+      "measured_core_mhz": 1394
+    },
+    "challenger": {
+      "strip_rows": 1024,
+      "th_s": 64.80824,
+      "watts": 39.116612,
+      "j_per_tmac": 0.603575,
+      "measured_core_mhz": 1397
+    },
+    "short_clock_comparison_same_build": [
+      {
+        "jobs": 2,
+        "th_s": 64.732169,
+        "watts": 38.258963,
+        "j_per_tmac": 0.591035,
+        "sm_mhz": 1394.0
+      },
+      {
+        "jobs": 2,
+        "th_s": 82.695434,
+        "watts": 58.74204,
+        "j_per_tmac": 0.710342,
+        "sm_mhz": 1787.0
+      }
+    ]
+  },
+  "real_testnet2_template_scans": [
+    {
+      "gpu": "RTX 5060 Ti 8 GB",
+      "version": "v0.1.1-dev.2+r10.3",
+      "measured_scans": 777,
+      "full_scan_th_s": 98.419616,
+      "memory_mhz": 7001
+    },
+    {
+      "gpu": "RTX 5060 Ti 8 GB",
+      "version": "v0.1.2-dev.3",
+      "measured_scans": 463,
+      "full_scan_th_s": 98.736299,
+      "memory_mhz": 13801
+    },
+    {
+      "gpu": "RTX 5070 Ti",
+      "version": "v0.1.2-dev.3",
+      "measured_scans": 446,
+      "full_scan_th_s": 156.116763
+    },
+    {
+      "gpu": "DGX Spark GB10",
+      "version": "v0.1.2-dev.3-gb10.2",
+      "measured_scans": 81,
+      "full_scan_th_s": 64.622558
+    }
+  ],
+  "active_chain_blocks_at_verification": [
+    {
+      "gpu": "RTX 5060",
+      "version": "v0.1.2-dev.2",
+      "blocks": 1
+    },
+    {
+      "gpu": "RTX 5060 Ti 8 GB",
+      "version": "v0.1.2-dev.2",
+      "blocks": 1
+    },
+    {
+      "gpu": "RTX 5070",
+      "version": "v0.1.2-dev.2",
+      "blocks": 1
+    },
+    {
+      "gpu": "RTX 5070 Ti",
+      "version": "v0.1.2-dev.2",
+      "blocks": 1
+    },
+    {
+      "gpu": "RTX 5080",
+      "version": "v0.1.2-dev.2",
+      "blocks": 1
+    },
+    {
+      "gpu": "RTX 5060 Ti 8 GB",
+      "version": "v0.1.2-dev.3",
+      "blocks": 1
+    },
+    {
+      "gpu": "RTX 5070 Ti",
+      "version": "v0.1.2-dev.3",
+      "blocks": 1
+    },
+    {
+      "gpu": "DGX Spark GB10",
+      "version": "v0.1.2-dev.3-gb10.2",
+      "blocks": 1
+    },
+    {
+      "gpu": "RTX 5060 Ti 8 GB",
+      "version": "v0.1.1-dev.2+r10.3",
+      "blocks": 1
+    }
+  ]
+}

@@ -62,7 +62,7 @@ class Plan {
         }catch(...){close();throw;}
     }
 public:
-    explicit Plan(bool packed=packed_selected()):packed_(packed){}
+    explicit Plan(bool packed=packed_selected(),bool pair_columns=false):packed_(packed),packed_main_(pair_columns){}
     ~Plan(){close();}
     Plan(const Plan&)=delete;
     std::uint64_t cells()const{return cells_;}

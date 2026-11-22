@@ -245,11 +245,11 @@ def check_existing_proof(control_file, roots_file, hits_file, tile, proof_file, 
             "timings":timings}
 
 
-def external_proof(program, directory, tile, out, limit):
+def external_proof(program, directory, tile, out, limit, *, env=None):
     if out.exists(): raise FileExistsError(out)
     cmd=[str(program.resolve()), "--control", str((directory/"control.bin").resolve()),
          "--roots", str((directory/"roots.bin").resolve()), "--tile-index",str(tile),"--out",str(out.resolve())]
-    reply=subprocess.run(cmd,check=True,text=True,capture_output=True).stdout
+    reply=subprocess.run(cmd,check=True,text=True,capture_output=True,env=env).stdout
     if len(reply)>65536:
         raise ValueError("oversized prover acknowledgement")
     receipt=json.loads(reply)
@@ -263,7 +263,7 @@ def external_proof(program, directory, tile, out, limit):
     return data,sha
 
 
-def prove_candidates(plan,roots,hits_file,directory,program,native_dir,*,full_reference=False):
+def prove_candidates(plan,roots,hits_file,directory,program,native_dir,*,full_reference=False,prover_env=None):
     meta=plan.meta(roots)
     m,n,_,h,w=plan.dims
     total=(m//h)*(n//w)
@@ -278,7 +278,8 @@ def prove_candidates(plan,roots,hits_file,directory,program,native_dir,*,full_re
         checked+=1
         with tempfile.TemporaryDirectory(prefix=".gpu-proof-",dir=directory) as tmp:
             started=time.monotonic()
-            raw,sha=external_proof(program,directory,tile,Path(tmp)/"candidate.plain.bin",max_proof_bytes(plan,openings))
+            raw,sha=external_proof(program,directory,tile,Path(tmp)/"candidate.plain.bin",max_proof_bytes(plan,openings),
+                                   env=prover_env)
             build_s+=time.monotonic()-started
         if not verify_candidate(pm,header,plan,roots,tile,location,fold,digest,raw,timings,
                                 full_directory=directory if full_reference else None):

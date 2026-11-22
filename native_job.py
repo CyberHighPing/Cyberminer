@@ -11,7 +11,7 @@ import time
 
 import numpy as np
 from blake3 import blake3
-from cuda_worker import STREAM_VARIANTS, abort_on_error, add_geometry_options, streamed_variant
+from cuda_worker import STREAM_VARIANTS, abort_on_error, add_geometry_options, proof_environment, streamed_variant
 
 import host_miner as host
 from host_math import prepare_operand
@@ -126,7 +126,7 @@ def encode_global_rows(codes, side, first, e_seed, seed_b):
     return encoded
 
 
-def proof_for_output(plan, roots, hits, directory, native_dir, *, checked_count, full_reference=False, gpu_prover=None):
+def proof_for_output(plan, roots, hits, directory, native_dir, *, checked_count, full_reference=False, gpu_prover=None, prover_env=None):
     """Skip host operand generation until a checked, witness-eligible record exists."""
     meta = plan.meta(roots)
     total = (meta["m"]//meta["h"])*(meta["n"]//meta["w"])
@@ -143,7 +143,8 @@ def proof_for_output(plan, roots, hits, directory, native_dir, *, checked_count,
     if gpu_prover is not None:
         from gpu_proof import prove_candidates
         if not full_reference:pretty(directory/"job.json",dict(meta,proof_inputs="gpu_prover"))
-        return prove_candidates(plan,roots,hits,directory,Path(gpu_prover),native_dir,full_reference=full_reference)
+        return prove_candidates(plan,roots,hits,directory,Path(gpu_prover),native_dir,full_reference=full_reference,
+                                prover_env=prover_env)
     if not full_reference:
         hashes = {}
         regenerated, pieces = expected_roots(plan, directory, hashes)
@@ -182,7 +183,8 @@ def attempt(prep, args, directory, worker=None):
         if not getattr(args, "fast_profile", False):
             print(json.dumps(report), flush=True)
         outcome = proof_for_output(plan, roots, stage/"hits.phits", stage, args.native_dir, checked_count=count,
-                                   full_reference=getattr(args,"native_full_reference",False),gpu_prover=getattr(args,"gpu_prover",None))
+                                   full_reference=getattr(args,"native_full_reference",False),gpu_prover=getattr(args,"gpu_prover",None),
+                                   prover_env=proof_environment(args))
         outcome["threshold_hits"] = count
         if getattr(args,"stream_b",False):
             outcome.update(streamed_b=report["streamed_b"],dense_macs=prep.m*prep.n*prep.k,covered_windows=report["passes"],

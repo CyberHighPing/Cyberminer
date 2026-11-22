@@ -90,18 +90,31 @@ public:
         return std::max({a_.scratch_bytes,b_.scratch_bytes,pearl_noise::scratch_bytes(dims_[2],batch)});
     }
     size_t panel_a_storage() const {return pearl_panel_b::storage(a_);}
-    Digest commit_stream_role(pearl_jobgen::Side side,Byte* arena,size_t size,prep_inputs::Row* meta,Word* invalid,bool fused) const {
+    Digest commit_stream_role(pearl_jobgen::Side side,Byte* arena,size_t size,prep_inputs::Row* meta,Word* invalid,bool fused,proof_checkpoints::Planes* cuts=nullptr,Byte* raw_output=nullptr) const {
         const bool left=side==pearl_jobgen::Side::A;
         pearl_jobgen::Roots roots{};
-        gpu(pearl_panel_b::commit(arena,size,left?a_:b_,seed_,left?key_a_:key_b_,roots,nullptr,meta,invalid,fused,side),"stream and commit raw operand");
+        gpu(pearl_panel_b::commit(arena,size,left?a_:b_,seed_,left?key_a_:key_b_,roots,nullptr,meta,invalid,fused,side,cuts,raw_output),"stream and commit raw operand");
         return roots.combined;
     }
     size_t panel_b_storage() const {return pearl_panel_b::storage(b_);}
     size_t panel_b_scratch(int batch) const {return std::max(a_.scratch_bytes,pearl_noise::scratch_bytes(dims_[2],batch));}
     const Digest& generator_seed()const{return seed_;}
-    Digest commit_panel_b(Byte* arena,size_t size,prep_inputs::Row* meta=nullptr,Word* invalid=nullptr,bool inline_leaves=false) const {
-        pearl_jobgen::Roots roots{};gpu(pearl_panel_b::commit(arena,size,b_,seed_,key_b_,roots,nullptr,meta,invalid,inline_leaves),"stream raw B leaves and commit");
+    Digest commit_panel_b(Byte* arena,size_t size,prep_inputs::Row* meta=nullptr,Word* invalid=nullptr,bool inline_leaves=false,proof_checkpoints::Planes* cuts=nullptr) const {
+        pearl_jobgen::Roots roots{};gpu(pearl_panel_b::commit(arena,size,b_,seed_,key_b_,roots,nullptr,meta,invalid,inline_leaves,pearl_jobgen::Side::B,cuts),"stream raw B leaves and commit");
         return roots.combined;
+    }
+    void write_cut(std::ostream& out,const State& state,const proof_checkpoints::Planes& cuts) const {
+        std::array<Byte,SHA256_DIGEST_LENGTH> hash{};
+        if(!SHA256(file_.data(),file_.size(),hash.data()))throw std::runtime_error("control hash failed");
+        const auto roots=state.receipt();
+        out.write("PRLMCUT1",8);
+        out.write(reinterpret_cast<const char*>(hash.data()),hash.size());
+        out.write(reinterpret_cast<const char*>(roots.data()),roots.size());
+        for(const auto& c:cuts) {
+            if(!c.leaves||c.nodes.size()!=proof_checkpoints::width(c.leaves))throw std::logic_error("incomplete Merkle checkpoint");
+            out.write(reinterpret_cast<const char*>(&c.leaves),sizeof(c.leaves));
+            out.write(reinterpret_cast<const char*>(c.nodes.data()),c.nodes.size()*sizeof(Digest));
+        }
     }
     State bind(const Digest& hash_a,const Digest& hash_b) const {
         State s;

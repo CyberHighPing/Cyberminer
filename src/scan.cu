@@ -1,6 +1,7 @@
 // Linux, CUDA 12.8+ with SM120 support. Dense E4M3, B200 arithmetic.
 // A and B are row-major [M,K] and [N,K], already transformed by Pearl.
 #include <cuda_runtime.h>
+#include "power_limit.hpp"
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -21,6 +22,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <poll.h>
+#define PEARL_SCAN_INPUTS 1
 #include "worker_buffer_pool.hpp"
 #include "geometry_filter.hpp"
 #include "ticket_wire.hpp"
@@ -83,9 +85,11 @@ struct RetainedScanPointers {
 };
 using WorkerBufferCache = pearl_pool::Cache<RetainedScanPointers>;
 
+#include <thread>
 struct Event {
     cudaEvent_t value;
     Event() { CUDA(cudaEventCreate(&value)); }
+    explicit Event(unsigned flags) { CUDA(cudaEventCreateWithFlags(&value,flags)); }
     ~Event() { cudaEventDestroy(value); }
 };
 struct FoldStream {
@@ -595,9 +599,6 @@ static int scan_attempt(const Options& o, WorkerBufferCache* pool, bool allow_ex
 #ifdef PEARL_WITH_CUTLASS
     pearl_cutlass::Candidate candidate(o.device,dev.multiProcessorCount);
 #endif
-    if (std::string(dev.name).find("RTX 5060 Ti")==std::string::npos || dev.major!=12 ||
-        dev.minor!=0 || dev.totalGlobalMem<7000ull*1024*1024 || dev.totalGlobalMem>9000ull*1024*1024)
-        throw std::runtime_error("select an RTX 5060 Ti 8GB (SM120)");
     verified_lt::Plan lt_plan;
     if (lt_layout && (o.rows==4096 || o.m%o.rows==4096) && (o.cols==16384 || o.n%o.cols==16384)) {
         lt_plan.prepare(4096,16384,o.k);
@@ -917,7 +918,15 @@ static int scan_attempt(const Options& o, WorkerBufferCache* pool, bool allow_ex
     return 0;
 }
 
-static int scan(const Options& o,WorkerBufferCache* pool=nullptr) {
+static int scan(const Options& o,WorkerBufferCache* pool=nullptr,pearl_device::WorkerPowerReader* power_session=nullptr) {
+    cudaDeviceProp dev{};
+    CUDA(cudaGetDeviceProperties(&dev, o.device));
+    if (!pearl_device::supported(dev))
+        throw std::runtime_error(std::string(pearl_device::select_message));
+    pearl_device::PowerWatch board_guard;
+    board_guard.start(*pearl_device::profile_for(dev.name), o.device, power_session);
+    if (!pearl_device::supports_scan_shape(dev.name, o.m, o.n, o.k))
+        throw std::invalid_argument("this board supports up to the testnet2 scan dimensions in this build");
 #ifdef PEARL_WITH_CUTLASS
     if(o.stream_b && o.variant==verified_lt::name)return panel_reference::run(o);
     if(o.stream_b && right_resident::enabled())return right_resident::run(o,pool);
@@ -947,6 +956,7 @@ static word frame_word() {
 // A single trusted local pipe keeps one CUDA process alive across independent
 // jobs. Each request still supplies its own input files, target and output.
 static int serve() {
+    pearl_device::WorkerPowerReader power_session;
     const char* env=std::getenv("PEARL_SCAN_BUFFER_POOL");
     const std::string mode=env?env:"off";
     WorkerBufferCache cache(mode=="reuse");
@@ -977,7 +987,7 @@ static int serve() {
         }
         std::vector<char*> args;
         for (auto& s:fields) args.push_back(s.data());
-        scan(parse(int(args.size()),args.data()),pool);
+        scan(parse(int(args.size()),args.data()),pool,&power_session);
         std::cout.flush();
     }
     return 0;
@@ -994,8 +1004,22 @@ int main(int argc,char** argv) {
         return 0;
     }
     try {
+        if (argc==2 && (std::string_view(argv[1])=="--device-profile" || std::string_view(argv[1])=="--benchmark-preset")) {
+            cudaDeviceProp dev{};
+            CUDA(cudaGetDeviceProperties(&dev, 0));
+            if (!pearl_device::supported(dev))
+                throw std::invalid_argument(std::string(pearl_device::select_message));
+            const auto& profile = *pearl_device::profile_for(dev.name);
+            pearl_device::verify_power(profile, 0);
+            const char* preset = profile.large_scan ? "throughput" : "testnet2";
+            if (std::string_view(argv[1])=="--device-profile")
+                std::cout << preset << ' ' << profile.strip_rows << '\n';
+            else std::cout << preset << '\n';
+            return 0;
+        }
         if (argc==2 && std::string(argv[1])=="--worker") return serve();
         return scan(parse(argc,argv));
     }
+    catch (const pearl_device::PowerLimitError& e) { std::cerr << e.what() << '\n'; return 78; }
     catch (const std::exception& e) { std::cerr<<"pearl-fp8-scan: "<<e.what()<<'\n'; return 1; }
 }

@@ -2,6 +2,7 @@
 #include "scan_depth.hpp"
 #include "right_plan.cuh"
 #include "panel_order.hpp"
+#include "ticket_batch.cuh"
 
 namespace right_resident {
 inline int run(const Options& o,WorkerBufferCache* pool) {
@@ -27,43 +28,81 @@ inline int run(const Options& o,WorkerBufferCache* pool) {
     const size_t row_offset=(noise_bytes+15)&~size_t(15);
     const size_t meta_bytes=(size_t(o.m)+o.n)*sizeof(prep_inputs::Row);
     const size_t scratch_bytes=row_offset+meta_bytes;
-    const size_t capacity=o.hit_capacity,extra=capacity*sizeof(pearl_ticket::Hit)+sizeof(pearl_ticket::Count)+sizeof(Word);
-    const size_t explicit_bytes=arena_bytes+scratch_bytes+extra;
-    if(explicit_bytes>pearl_pool::ceiling)throw std::runtime_error("right residency exceeds 7168 MiB");
-    pearl_pool::Meter meter;
-    pearl_pool::Shape layout{o.device,{o.m,o.n,o.k,o.h,o.w,o.rows,o.cols,o.k,o.row_pad,o.hit_capacity},
-                             {arena_bytes,0,scratch_bytes,0,0,capacity,1,1,0},1u<<22,o.variant};
-    if(pool){meter=pool->previous_idle_release();pool->match(&layout,meter);}
+    const size_t capacity=o.hit_capacity;
+    const size_t per_slot=capacity*sizeof(pearl_ticket::Hit)+sizeof(pearl_ticket::Count);
+    size_t queue_slots=std::min<size_t>((o.m+strip-1)/strip,queued_filter::requested());
+    const size_t fixed=arena_bytes+scratch_bytes+sizeof(Word);
+    if(fixed<pearl_pool::ceiling)queue_slots=std::max<size_t>(1,std::min(queue_slots,(pearl_pool::ceiling-fixed)/per_slot));
+    const size_t extra=queue_slots*per_slot+sizeof(Word);
+    const size_t base_bytes=arena_bytes+scratch_bytes+extra;
+    if(base_bytes>pearl_pool::ceiling)throw std::runtime_error("right residency exceeds 7168 MiB");
     CUDA(cudaSetDevice(o.device));
     cudaDeviceProp dev;CUDA(cudaGetDeviceProperties(&dev,o.device));
-    if(std::string(dev.name).find("RTX 5060 Ti")==std::string::npos||dev.major!=12||dev.minor!=0||
-       dev.totalGlobalMem<7000ull*1024*1024||dev.totalGlobalMem>9000ull*1024*1024)
-        throw std::runtime_error("select an RTX 5060 Ti 8GB");
     size_t free_before,total;CUDA(cudaMemGetInfo(&free_before,&total));
-    const size_t retained=pool?pool->retained():0;
-    if(!pearl_pool::admit(explicit_bytes,0,false,pool?pool->admission_available(free_before,total):free_before).fits)
+    const size_t available=pool?pool->admission_available(o.device,free_before,total):free_before;
+    if(!pearl_pool::admit(base_bytes,0,false,available).fits)
         throw std::runtime_error("too little free VRAM for the resident right operand");
+
+    // At the standard shape each original operand occupies 2 GiB. The cached
+    // bytes belong to this job and are completely rewritten for every seed.
+    const char* setting=std::getenv("CYBERMINER_OPERAND_CACHE");
+    if(setting && std::strcmp(setting,"auto") && std::strcmp(setting,"off"))
+        throw std::invalid_argument("CYBERMINER_OPERAND_CACHE expects auto or off");
+    const bool small_gpu=!std::strcmp(dev.name,"NVIDIA GeForce RTX 5060") ||
+                         !std::strcmp(dev.name,"NVIDIA GeForce RTX 5060 Ti");
+    bool cache_a=small_gpu && pearl_device::supported(dev) && direct_a && packed_selected() &&
+                 o.m==131072 && o.n==131072 && o.k==16384 &&
+                 (!setting || !std::strcmp(setting,"auto")) &&
+                 pearl_pool::admit(base_bytes+a_bytes,0,false,available).fits;
+    pearl_pool::Meter meter;
+    pearl_pool::Shape layout{o.device,{o.m,o.n,o.k,o.h,o.w,o.rows,o.cols,o.k,o.row_pad,o.hit_capacity},
+                             {arena_bytes,(cache_a?a_bytes:0),scratch_bytes,0,0,capacity*queue_slots,queue_slots,1,0},1u<<22,o.variant};
+    if(pool){meter=pool->previous_idle_release();pool->match(&layout,meter);}
+    const size_t retained=pool?pool->retained():0;
     std::unique_ptr<RetainedScanPointers> owner;
     if(pool&&pool->reuse){meter.warm=pool->has();owner=meter.warm?pool->take():std::make_unique<RetainedScanPointers>();}
     auto take=[&](size_t i){return owner?owner->take(i):nullptr;};
     auto* measure=pool?&meter:nullptr;
     Buffer<Byte> arena(arena_bytes,take(0),measure),scratch(scratch_bytes,take(2),measure);
-    Buffer<pearl_ticket::Hit> hits(capacity,take(6),measure);
-    Buffer<pearl_ticket::Count> count(1,take(7),measure);
+    Buffer<pearl_ticket::Hit> hits(capacity*queue_slots,take(6),measure);
+    Buffer<pearl_ticket::Count> count(queue_slots,take(7),measure);
     Buffer<Word> invalid(1,take(8),measure);
+    // Keep the required group even if another CUDA client claims memory
+    // between admission and allocation. An OOM affects only this optimization.
+    Buffer<Byte> raw(0,take(1),measure);
+    if(cache_a && !raw.ptr){
+        const auto attempt=Clock::now();
+        const auto status=cudaMalloc(&raw.ptr,a_bytes);
+        if(measure)measure->acquire_s+=std::chrono::duration<double>(Clock::now()-attempt).count();
+        if(status==cudaSuccess){
+            if(measure)++measure->allocations;
+        }else if(status==cudaErrorMemoryAllocation){
+            const auto pending=cudaGetLastError();
+            if(pending!=cudaSuccess && pending!=cudaErrorMemoryAllocation)CUDA(pending);
+            cache_a=false;
+        }else{
+            CUDA(status);
+        }
+    }
+    layout.capacities[1]=cache_a?a_bytes:0;
+    const size_t explicit_bytes=base_bytes+layout.capacities[1];
     const bool packed=packed_selected();
-    Plan matrix(packed);
+    const bool pair_columns=o.m==131072 && o.n==131072 && o.k==16384 && !std::strcmp(dev.name,"NVIDIA GeForce RTX 5070");
+    Plan matrix(packed,pair_columns);
     size_t free_after;CUDA(cudaMemGetInfo(&free_after,&total));
     auto* meta_a=reinterpret_cast<prep_inputs::Row*>(scratch.ptr+row_offset);
     auto* meta_b=meta_a+o.m;
     Byte* b=arena.ptr;
     Byte* a=b+b_bytes;
+    Byte* raw_a=raw.ptr;
     auto* folded=reinterpret_cast<Word*>(a+stage_bytes);
     CUDA(cudaMemset(invalid.ptr,0,sizeof(Word)));
     const auto commit_begin=Clock::now();
-    const auto hb=job.commit_panel_b(arena.ptr,arena_bytes,meta_b,invalid.ptr,true);
+    proof_checkpoints::Planes cut_data;
+    auto* cuts=direct_a && proof_checkpoints::enabled()?&cut_data:nullptr;
+    const auto hb=job.commit_panel_b(arena.ptr,arena_bytes,meta_b,invalid.ptr,true,cuts);
     const auto b_commit_end=Clock::now();
-    const auto ha=direct_a?job.commit_stream_role(pearl_jobgen::Side::A,arena.ptr,arena_bytes,meta_a,invalid.ptr,true):job.generate_and_commit(pearl_jobgen::Side::A,arena.ptr,a_bytes,arena.ptr+a_bytes,commit_tail,meta_a,invalid.ptr);
+    const auto ha=direct_a?job.commit_stream_role(pearl_jobgen::Side::A,arena.ptr,arena_bytes,meta_a,invalid.ptr,true,cuts,raw_a):job.generate_and_commit(pearl_jobgen::Side::A,arena.ptr,a_bytes,arena.ptr+a_bytes,commit_tail,meta_a,invalid.ptr);
     const auto a_commit_end=Clock::now();
     const auto state=job.bind(ha,hb);
     const auto desired_fold=native_fold::requested();
@@ -94,10 +133,106 @@ inline int run(const Options& o,WorkerBufferCache* pool) {
                                                          all_tiles*16<=pearl_geometry::legacy_words);
     Event prep_start,raw_end,prep_end,gemm_end;
     int strips=0;
+    size_t filter_batches=0,replayed_slabs=0;std::uint64_t replayed_cells=0;
+    enum class BatchWait {spin,block,early};
+    BatchWait wait_mode=BatchWait::spin;
+    if(queue_slots>1){
+        const char* setting=std::getenv("PEARL_R10_BATCH_WAIT");
+        if(!setting||!std::strcmp(setting,"spin"))wait_mode=BatchWait::spin;
+        else if(!std::strcmp(setting,"block"))wait_mode=BatchWait::block;
+        else if(!std::strcmp(setting,"early85"))wait_mode=BatchWait::early;
+        else throw std::invalid_argument("unknown batch wait mode");
+    }
+    size_t blocked_batches=0,early_batches=0;
+    double requested_sleep_s=0;
     size_t cache_bytes=0;
     {
         CacheWindow cache(a,stage_bytes,dev);cache_bytes=cache.bytes();
         column_stream::DrainOnError drain{nullptr};
+        if(queue_slots>1) {
+            struct StripTimes {Event start,raw,prepared,matrix,filtered;};
+            Event parked_completion(cudaEventBlockingSync);
+            double previous_seconds_per_row=0,older_seconds_per_row=0;
+            std::vector<StripTimes> times(queue_slots);
+            queued_filter::Batch queue(hits.ptr,count.ptr,capacity,queue_slots);
+            std::unique_ptr<Plan> replay_matrix;
+            auto prepare_a=[&](int first,int rows,bool build) {
+                if(packed)CUDA(left_pack::prepare(128,cache_a,a,stage_bytes,rows,o.k,first,ek,fk,job.generator_seed(),batch,cache_a?raw_a+size_t(first)*o.k:nullptr,cache_a?size_t(rows)*o.k:0,
+                                  scratch.ptr,noise_bytes,meta_a+first,invalid.ptr,nullptr,build,cache_a));
+                else CUDA(prep_inputs::prepare(mode,a,rows,o.k,0,first,ek,fk,job.generator_seed(),batch,scratch.ptr,noise_bytes,meta_a+first,invalid.ptr,build,nullptr));
+            };
+            auto replay=[&](const pearl_ticket::Slab& slab,pearl_ticket::Hit* ticket_area,pearl_ticket::Count* counter,auto&& emit) {
+                const int first=int(slab.tile_row0*o.h),rows=int(slab.tile_rows*o.h);
+                if(!replay_matrix)replay_matrix=std::make_unique<Plan>(packed,pair_columns);
+                if(!packed)job.regenerate_a(a,stage_bytes,first,rows,nullptr);
+                prepare_a(first,rows,false);
+                replay_matrix->run(a,b,folded,o.k,rows,o.n);
+                CUDA(pearl_ticket::filter_slab(folded,slab,wire.job,ticket_area,counter,capacity,nullptr,emit));
+                replayed_cells+=std::uint64_t(rows)*o.n;
+            };
+            auto elapsed=[](const Event& a,const Event& b) {
+                float ms=0;CUDA(cudaEventElapsedTime(&ms,a.value,b.value));return double(ms);
+            };
+            for(int first=0;first<o.m;) {
+                const int batch_first=first;
+                const auto batch_queued=Clock::now();
+                queue.begin();
+                size_t active=0;
+                while(first<o.m&&active<queue_slots) {
+                    auto& stamp=times[active++];
+                    const int rows=std::min(strip,o.m-first);
+                    CUDA(cudaEventRecord(stamp.start.value));
+                    if(!packed)job.regenerate_a(a,stage_bytes,first,rows,nullptr);
+                    CUDA(cudaEventRecord(stamp.raw.value));
+                    prepare_a(first,rows,first==0);
+                    CUDA(cudaEventRecord(stamp.prepared.value));
+                    matrix.run(a,b,folded,o.k,rows,o.n);
+                    CUDA(cudaEventRecord(stamp.matrix.value));
+                    const pearl_ticket::Slab slab{size_t(first/o.h),0,tile_cols,size_t(rows/o.h),tile_cols};
+                    if(!coverage.append(slab))throw std::runtime_error("overlapping or incomplete row coverage");
+                    queue.issue(folded,slab,wire.job);
+                    CUDA(cudaEventRecord(stamp.filtered.value));
+                    first+=rows;
+                    ++strips;
+                }
+                const int batch_rows=first-batch_first;
+                auto last_event=times[active-1].filtered.value;
+                if(wait_mode==BatchWait::block||(wait_mode==BatchWait::early&&previous_seconds_per_row==0)){
+                    CUDA(cudaEventRecord(parked_completion.value));
+                    CUDA(cudaEventSynchronize(parked_completion.value));
+                    ++blocked_batches;
+                }else{
+                    if(wait_mode==BatchWait::early){
+                        const double seconds_per_row=older_seconds_per_row>0
+                            ?std::min(older_seconds_per_row,previous_seconds_per_row):previous_seconds_per_row;
+                        const double delay_s=seconds_per_row*batch_rows*0.85-0.00025;
+                        const auto deadline=batch_queued+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(delay_s));
+                        const auto remaining=deadline-Clock::now();
+                        if(remaining>std::chrono::milliseconds(1)){
+                            requested_sleep_s+=std::chrono::duration<double>(remaining).count();
+                            ++early_batches;
+                            std::this_thread::sleep_until(deadline);
+                        }
+                    }
+                    CUDA(cudaEventSynchronize(last_event));
+                }
+                if(wait_mode==BatchWait::early){
+                    older_seconds_per_row=previous_seconds_per_row;
+                    previous_seconds_per_row=elapsed(times.front().start,times[active-1].filtered)/(1000.0*batch_rows);
+                }
+                const auto read_begin=Clock::now();
+                replayed_slabs+=queue.collect(replay,[&](const pearl_ticket::Hit* items,size_t n){order.append(0,items,n);});
+                filter_seconds+=std::chrono::duration<double>(Clock::now()-read_begin).count();
+                for(size_t i=0;i<active;i++) {
+                    const auto& stamp=times[i];
+                    regen_seconds+=elapsed(stamp.start,stamp.raw)/1000.;
+                    prepare_seconds+=elapsed(stamp.raw,stamp.prepared)/1000.;
+                    gemm_ms+=elapsed(stamp.prepared,stamp.matrix);
+                    filter_seconds+=elapsed(stamp.matrix,stamp.filtered)/1000.;
+                }
+                ++filter_batches;
+            }
+        }else
         for(int first=0;first<o.m;first+=strip){
             const int rows=std::min(strip,o.m-first);
             CUDA(cudaEventRecord(prep_start.value));
@@ -105,8 +240,8 @@ inline int run(const Options& o,WorkerBufferCache* pool) {
                 job.regenerate_a(a,stage_bytes,first,rows,nullptr);
                 CUDA(cudaEventRecord(raw_end.value));
             }
-            if(packed)CUDA(left_pack::prepare(128,false,a,stage_bytes,rows,o.k,first,ek,fk,job.generator_seed(),batch,nullptr,0,
-                                              scratch.ptr,noise_bytes,meta_a+first,invalid.ptr,nullptr,first==0));
+            if(packed)CUDA(left_pack::prepare(128,cache_a,a,stage_bytes,rows,o.k,first,ek,fk,job.generator_seed(),batch,cache_a?raw_a+size_t(first)*o.k:nullptr,cache_a?size_t(rows)*o.k:0,
+                                              scratch.ptr,noise_bytes,meta_a+first,invalid.ptr,nullptr,first==0,cache_a));
             else CUDA(prep_inputs::prepare(mode,a,rows,o.k,0,first,ek,fk,job.generator_seed(),batch,scratch.ptr,noise_bytes,meta_a+first,invalid.ptr,first==0,nullptr));
             CUDA(cudaEventRecord(prep_end.value));
             matrix.run(a,b,folded,o.k,rows,o.n);
@@ -131,11 +266,19 @@ inline int run(const Options& o,WorkerBufferCache* pool) {
     }
     if(!coverage.complete()||matrix.cells()!=std::uint64_t(o.m)*o.n)throw std::runtime_error("incomplete dense work");
     order.emit([&](const auto* items,size_t n){wire.append(output.file,items,n);});
-    wire.finish(output.file,coverage);paired_output::finish(roots,output);
+    wire.finish(output.file,coverage);
+    if(cuts && wire.hits()) {
+        paired_output::File checkpoint(o.roots_out+".cut");
+        if(checkpoint.same_destination(roots)||checkpoint.same_destination(output))
+            throw std::invalid_argument("checkpoint output must have a distinct pathname");
+        job.write_cut(checkpoint.file,state,cut_data);
+        checkpoint.seal();checkpoint.preflight();checkpoint.publish();checkpoint.confirm();
+    }
+    paired_output::finish(roots,output);
     if(owner&&!wire.hits()){
-        owner->ptrs={arena.detach(),nullptr,scratch.detach(),nullptr,nullptr,nullptr,hits.detach(),count.detach(),invalid.detach(),nullptr};
+        owner->ptrs={arena.detach(),raw.detach(),scratch.detach(),nullptr,nullptr,nullptr,hits.detach(),count.detach(),invalid.detach(),nullptr};
         pool->keep(std::move(layout),false,explicit_bytes,std::move(owner));
-    }else{invalid.reset();count.reset();hits.reset();scratch.reset();arena.reset();}
+    }else{raw.reset();invalid.reset();count.reset();hits.reset();scratch.reset();arena.reset();}
     const double wall=std::chrono::duration<double>(Clock::now()-start).count();
     const auto macs=matrix.cells()*o.k;
     const auto windows=matrix.cells()/(std::uint64_t(window_m)*window_n);
@@ -154,19 +297,28 @@ inline int run(const Options& o,WorkerBufferCache* pool) {
              <<",\"gemm_ms\":"<<gemm_ms<<",\"fold_ms\":0,\"scan_wall_s\":"<<wall<<",\"kernel_tmac_s\":"<<double(macs)/gemm_ms/1e9
              <<",\"scan_equivalent_th_s\":"<<double(macs)/wall/1e12<<",\"cublaslt_calls\":0,\"cublaslt_attempts\":0,\"cublaslt_fallback_calls\":0"
              <<",\"cutlass_fallback_calls\":0,\"native_fallback_calls\":0,\"cublaslt_workspace_bytes\":0,\"raw_product_buffer_bytes\":0"
-             <<",\"arena_bytes\":"<<arena_bytes<<",\"job_scratch_bytes\":"<<scratch_bytes<<",\"filter_counter_bytes\":"<<extra
+             <<",\"arena_bytes\":"<<(explicit_bytes-scratch_bytes-extra)<<",\"job_scratch_bytes\":"<<scratch_bytes<<",\"filter_counter_bytes\":"<<extra
              <<",\"physical_matrix_kernel_launches\":"<<matrix.launches()<<",\"computed_output_cells\":"<<matrix.cells()
              <<",\"B_reuse_grid_N\":"<<direct_main::selected_grid()<<",\"A_strip_M_ctas\":"<<strip/256
+             <<",\"batch_wait_mode\":\""<<(queue_slots<=1?"off":wait_mode==BatchWait::block?"block":wait_mode==BatchWait::early?"early85":"spin")<<"\""
+             <<",\"batch_blocking_waits\":"<<blocked_batches<<",\"batch_early_sleeps\":"<<early_batches<<",\"batch_requested_sleep_s\":"<<requested_sleep_s
+             <<",\"filter_batch_slots\":"<<queue_slots<<",\"filter_batches\":"<<filter_batches
+             <<",\"replayed_filter_slabs\":"<<replayed_slabs<<",\"replayed_dense_macs\":"<<replayed_cells*o.k
              <<",\"A_streamed_value_leaves\":"<<(direct_a?"true":"false")<<",\"A_commit_workspace_bytes\":"<<a_commit_workspace
              <<",\"A_commit_s\":"<<std::chrono::duration<double>(a_commit_end-b_commit_end).count()
              <<",\"B_commit_s\":"<<std::chrono::duration<double>(b_commit_end-commit_begin).count()
              <<",\"physical_a_strip_rows\":"<<strip<<",\"physical_a_strips\":"<<strips<<",\"persisting_l2_bytes\":"<<cache_bytes
              <<",\"prep_inputs\":\"leafvec\",\"prep_row_metadata_bytes\":"<<meta_bytes<<",\"direct_value_leaves\":true,\"regenerate_inside_quantize\":true"
+             <<",\"prep_mix_variant\":"<<(packed&&leaf_packed::prefix_enabled(o.k)?5:0)
+             <<",\"prep_B_prefix_batches\":"<<(packed&&leaf_packed::prefix_enabled(o.k)?leaf_packed::prefix_batches(0,o.n,o.k,batch):0)
+             <<",\"prep_leaf_variant\":"<<(leaf13::enabled(o.k)?3:0)
+             <<",\"prep_rescheduled_value_leaves\":"<<(!leaf13::enabled(o.k)?0ull:(b_bytes+(direct_a?a_bytes:0))/1024)
              <<",\"requested_native_fold\":\""<<native_fold::name(desired_fold)<<"\",\"actual_native_fold\":\""<<native_fold::name(matrix.fold())<<"\""
              <<",\"fold_domain_rows\":"<<(desired_fold==native_fold::Mode::canonical||!packed?0:size_t(o.m)+o.n)
              <<",\"resident_A_segment\":"<<(packed?128:0)<<",\"resident_B_segment\":"<<(packed?256:0)
              <<",\"resident_B_body_rows\":"<<body<<",\"resident_B_tail_rows\":"<<o.n-body
-             <<",\"resident_pack_extra_device_bytes\":0,\"A_XOF_in_quantization\":"<<(packed?"true":"false")
+             <<",\"resident_pack_extra_device_bytes\":"<<(explicit_bytes-base_bytes)<<",\"raw_operand_cache_planes\":"<<int(cache_a)
+             <<",\"A_XOF_in_quantization\":"<<(packed&&!cache_a?"true":"false")
              <<",\"noise_f_tables_built\":2,\"rect_fold_kernel\":\"fused\"}\n";
     return 0;
 }

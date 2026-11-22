@@ -1,7 +1,8 @@
-"""Run the RTX 5060 Ti 8 GB FP8 scanner, offline or with a local Pearl V4 gateway."""
+"""Run the desktop GeForce RTX 50-series FP8 scanner, offline or with a local Pearl V4 gateway."""
 import argparse
 from contextlib import nullcontext
 import json
+import os
 from pathlib import Path
 import secrets
 import subprocess
@@ -9,11 +10,12 @@ import sys
 import tempfile
 import time
 
-from cuda_worker import FAST_GEOMETRY, FUSED_STREAM_VARIANT, GEOMETRIES, STREAM_COLS, STREAM_ROWS, scanner_session
+from cuda_worker import CHECKPOINT_SETTING, FAST_GEOMETRY, FAST_STRIP_ROWS, RTX_5060_STRIP_ROWS, FUSED_STREAM_VARIANT, GEOMETRIES, STREAM_COLS, STREAM_ROWS, scanner_session
 from hashrate import RateDisplay
 from native_scan import Plan, scan_plan, synthetic_headers
 
 BUILD = Path(__file__).resolve().parent / "build"
+VERSION = "v0.2.0"
 
 
 class PublicArgumentParser(argparse.ArgumentParser):
@@ -24,6 +26,7 @@ class PublicArgumentParser(argparse.ArgumentParser):
 
 def arguments(argv=None):
     parser = PublicArgumentParser(prog="fp8miner.py", description=__doc__)
+    parser.add_argument("--version", action="version", version=f"Cyberminer {VERSION}")
     commands = parser.add_subparsers(dest="command", required=True)
     bench = commands.add_parser("bench", help="measure complete dense synthetic scans on one visible GPU")
     bench.add_argument("--jobs", type=int, default=2, help="number of measured jobs after one warm-up")
@@ -34,17 +37,24 @@ def arguments(argv=None):
     mine.add_argument("--native-dir", type=Path, help="directory containing the official pearl_mining extension")
     mine.add_argument("--attempts", type=int, default=0, help="maximum jobs, or zero to continue")
     mine.add_argument("--ancestor-depth", type=int, choices=range(1,5), default=1)
-    for command, default in ((bench, "throughput"), (mine, "testnet2")):
+    for command, default in ((bench, None), (mine, "testnet2")):
         command.add_argument("--no-status", action="store_true", help="hide the live rate lines on stderr")
         command.add_argument("--preset", choices=GEOMETRIES, default=default,
                              help=f"testnet2 selects 131072x131072x16384 for local solo work; "
-                                  f"throughput selects 1044480x540672x13312 for large scans (default: {default})")
+                                  f"throughput selects 1044480x540672x13312 on the RTX 5060 Ti 8 GB; default: {default or 'device-selected'}")
     parser.set_defaults(fast_profile=True, scanner=BUILD/"pearl-fp8-scan",
                         gpu_prover=BUILD/"pearl-fp8-open", persistent=True, native_dense=True, stream_b=True,
                         defer_filter=True, variant=FUSED_STREAM_VARIANT, k_per_pass=0, hit_capacity=256,
                         rows_per_pass=STREAM_ROWS, cols_per_pass=STREAM_COLS, cpu_reference=False,
                         native_full_reference=False, rpc_timeout=10.0, poll_seconds=2.0)
     args = parser.parse_args(argv)
+    args.automatic_preset = args.preset is None
+    if args.automatic_preset:
+        args.preset = "throughput"  # resolved against the visible device before starting work
+    default_checkpoints = "1" if args.command == "mine" and args.preset == "testnet2" else "0"
+    args.proof_checkpoints = os.environ.get(CHECKPOINT_SETTING, default_checkpoints)
+    if args.proof_checkpoints not in ("0", "1"):
+        parser.error("expected 0 or 1 for the Merkle checkpoint setting")
     args.m, args.n, args.k, h, w = GEOMETRIES[args.preset]
     args.tile = f"{h}x{w}"
     if args.command=="bench" and args.jobs<1:
@@ -52,6 +62,36 @@ def arguments(argv=None):
     if args.command=="mine" and args.attempts<0:
         parser.error("--attempts must be nonnegative")
     return args
+
+
+class UnsupportedPreset(ValueError):
+    pass
+
+
+def resolve_device_preset(args):
+    try:
+        raw = subprocess.check_output([str(args.scanner), "--device-profile"],
+                                      stderr=subprocess.PIPE, text=True, timeout=15)
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 78:
+            raise UnsupportedPreset("check the RTX 5080 limit (up to 250 W), zero graphics offset and selected clock profile") from exc
+        raise
+    values = raw.split()
+    if len(values) != 2 or values[0] not in GEOMETRIES or not values[1].isascii() or not values[1].isdigit():
+        raise ValueError("invalid scanner device profile")
+    selected, rows = values[0], int(values[1])
+    if not 256 <= rows <= 8192 or rows % 256:
+        raise ValueError("invalid scanner strip height")
+    args.strip_rows = rows
+    if selected == "throughput":
+        return
+    if args.preset == "testnet2":
+        return
+    if not args.automatic_preset:
+        raise UnsupportedPreset("use --preset testnet2 on the selected GPU in this build")
+    args.preset = selected
+    args.m, args.n, args.k, h, w = GEOMETRIES[selected]
+    args.tile = f"{h}x{w}"
 
 
 def benchmark(args):
@@ -97,6 +137,7 @@ def main(argv=None):
         raise FileNotFoundError("build/pearl-fp8-scan is missing. Run bash build.sh first.")
     if args.command=="mine" and not args.gpu_prover.is_file():
         raise FileNotFoundError("build/pearl-fp8-open is missing. Run bash build.sh first.")
+    resolve_device_preset(args)
     status = nullcontext(None) if args.no_status else RateDisplay(benchmark=args.command=="bench")
     with status as args.rate_display:
         if args.command=="bench":
@@ -111,6 +152,8 @@ def cli(argv=None):
         return main(argv)
     except KeyboardInterrupt:
         return 130
+    except UnsupportedPreset as exc:
+        message = str(exc)
     except ImportError:
         message = "a Python dependency or the official V4 verifier is missing"
     except FileNotFoundError:

@@ -289,23 +289,39 @@ STREAM_COLS = 16384
 FUSED_STREAM_VARIANT = "sm120-fused-stream"
 STREAM_VARIANTS = ("cublaslt-verified-pipeline", "cutlass120-coop-swizzle-pipeline", FUSED_STREAM_VARIANT)
 
-# The right-resident scanner packs B once and streams A in 1,536-row strips.
+# The scanner packs B once and streams A using the selected board profile.
 # Only the scanner child receives these choices. Device clocks are set separately.
 FAST_GEOMETRY = (1044480, 540672, 13312, 16, 32)
 TESTNET2_GEOMETRY = (131072, 131072, 16384, 16, 32)
 GEOMETRIES = {"throughput": FAST_GEOMETRY, "testnet2": TESTNET2_GEOMETRY}
 FAST_STRIP_ROWS = 1536
+RTX_5060_STRIP_ROWS = 1280
 FAST_SETTINGS = {
     "PEARL_B_COMMIT": "panel", "PEARL_RECT_FOLD": "vector", "PEARL_SCAN_BUFFER_POOL": "reuse",
     "PEARL_TAIL_LAYOUT": "overlap256", "PEARL_PANEL_GROUP": "3", "PEARL_PREP_INPUTS": "leafvec",
     "PEARL_RESIDENT_AXIS": "right", "PEARL_RESIDENT_BYTES": "packed", "PEARL_STRIP_CACHE": "persist",
     "PEARL_B_REUSE_GRID": "columns", "PEARL_STREAM_A_COMMIT": "leaves",
+    "PEARL_R10_FILTER_BATCH": "16", "PEARL_R10_BATCH_WAIT": "early85",
     "PEARL_ROW_STRIP": str(FAST_STRIP_ROWS), "PEARL_NATIVE_FINITE_FOLD": "paired",
 }
 
+CHECKPOINT_SETTING = "PEARL_PROOF_CHECKPOINTS"
+
+
+def proof_environment(args):
+    """Carry the public command's chosen proof mode to its children."""
+    mode = getattr(args, "proof_checkpoints", None)
+    if mode is None:
+        return None
+    return {**os.environ, CHECKPOINT_SETTING: mode}
+
+
 def scanner_environment(args):
     if getattr(args, "fast_profile", False):
-        return {**os.environ, **FAST_SETTINGS}
+        rows = getattr(args, "strip_rows", FAST_STRIP_ROWS)
+        if type(rows) is not int or not 256 <= rows <= 8192 or rows % 256:
+            raise ValueError("row strip height must be a multiple of 256 in the range 256..8192")
+        return {**(proof_environment(args) or os.environ), **FAST_SETTINGS, "PEARL_ROW_STRIP": str(rows)}
     return None
 
 
@@ -314,7 +330,7 @@ def streamed_variant(args, dims):
     if getattr(args, "fast_profile", False):
         if ((k,h,w) not in (FAST_GEOMETRY[2:], TESTNET2_GEOMETRY[2:])
                 or m <= 0 or n <= 0 or m % STREAM_ROWS or n % STREAM_COLS):
-            raise ValueError("the 8 GB presets require full 4096x16384 windows, K=13312 or 16384, and 16x32 tickets")
+            raise ValueError("the optimized presets require full 4096x16384 windows, K=13312 or 16384, and 16x32 tickets")
         return FUSED_STREAM_VARIANT
     tile_supported = (h,w) == (16,32) or ((h,w) == (16,16) and k == 16384)
     if (m < STREAM_ROWS or n < STREAM_COLS or m % STREAM_ROWS or n % STREAM_COLS

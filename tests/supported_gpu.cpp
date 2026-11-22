@@ -1,0 +1,45 @@
+#include "../src/supported_gpu.hpp"
+
+using pearl_device::supported;
+constexpr auto gib = 1024ull * 1024 * 1024;
+constexpr auto desktop = "NVIDIA GeForce RTX 5060";
+static_assert(supported(desktop, 12, 0, 8 * gib));
+static_assert(supported("NVIDIA GeForce RTX 5060 Ti", 12, 0, 8 * gib));
+static_assert(!supported("NVIDIA GeForce RTX 5060 Ti", 12, 0, 16 * gib));
+static_assert(!supported("NVIDIA GeForce RTX 5060 Laptop GPU", 12, 0, 8 * gib));
+static_assert(!supported("NVIDIA GeForce RTX 5070", 12, 0, 8 * gib));
+static_assert(!supported(desktop, 12, 1, 8 * gib));
+static_assert(!supported(desktop, 12, 0, 6 * gib));
+static_assert(!supported(desktop, 11, 0, 8 * gib));
+using pearl_device::supports_scan_shape;
+static_assert(supports_scan_shape(desktop, 131072, 131072, 16384));
+static_assert(!supports_scan_shape(desktop, 339968, 540672, 13312));
+static_assert(!supports_scan_shape(desktop, 1044480, 540672, 13312));
+static_assert(!supports_scan_shape(desktop, 131072, 131072, 32768));
+static_assert(supports_scan_shape("NVIDIA GeForce RTX 5060 Ti", 1044480, 540672, 13312));
+constexpr auto mid = "NVIDIA GeForce RTX 5070";
+constexpr auto ti = "NVIDIA GeForce RTX 5070 Ti";
+constexpr auto high = "NVIDIA GeForce RTX 5080";
+static_assert(pearl_device::profile_for(mid)->strip_rows == 2048);
+static_assert(pearl_device::profile_for(ti)->strip_rows == 1536);
+static_assert(pearl_device::profile_for(high)->strip_rows == 3072);
+static_assert(supported(mid, 12, 0, 12 * gib) && supported(ti, 12, 0, 16 * gib) && supported(high, 12, 0, 16 * gib));
+static_assert(!supported("NVIDIA GeForce RTX 5080 Laptop GPU", 12, 0, 16 * gib));
+static_assert(!supported(ti, 12, 0, 12 * gib) && !supported(high, 12, 1, 16 * gib));
+static_assert(supports_scan_shape(mid, 131072, 131072, 16384) && !supports_scan_shape(high, 339968, 540672, 13312));
+constexpr const auto& capped = *pearl_device::profile_for(high);
+static_assert(pearl_device::power_allowed(capped, 250000, 250000));
+static_assert(!pearl_device::power_allowed(capped, 250001, 250000));
+static_assert(!pearl_device::power_allowed(capped, 250000, 250001));
+static_assert(!pearl_device::power_allowed(capped, 0, 250000) && !pearl_device::power_allowed(capped, 250000, 0));
+static_assert(pearl_device::sample_allowed(250000, 289999, 1500, 0));
+static_assert(!pearl_device::sample_allowed(250000, 290000, 1500, 0));
+static_assert(!pearl_device::sample_allowed(290000, 240000, 1500, 0));
+static_assert(!pearl_device::sample_allowed(250000, 249000, 1501, 0));
+static_assert(!pearl_device::sample_allowed(250000, 249000, 1500, 1));
+static_assert(!pearl_device::sample_allowed(250000, 0, 1500, 0));
+static_assert(!pearl_device::sample_allowed(250000, (1ull << 32) + 10, 1500, 0));
+static_assert(pearl_device::sample_allowed(249000, 339999, 2400, 0, pearl_device::performance_5080));
+static_assert(!pearl_device::sample_allowed(249000, 340000, 2400, 0, pearl_device::performance_5080));
+static_assert(!pearl_device::sample_allowed(249000, 250000, 2401, 0, pearl_device::performance_5080));
+int main() {}

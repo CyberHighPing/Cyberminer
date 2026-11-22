@@ -14,7 +14,7 @@ import struct
 import sys
 import tempfile
 import time
-from contextlib import closing
+from contextlib import closing, ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from cuda_worker import add_worker_options, capacity_arg, scanner_session, scan_options, validate_stream_request
@@ -48,8 +48,10 @@ class Gateway:
             raise FrameTooLarge("request exceeds the official gateway's 4 MiB line limit")
         self.stream.sendall(line)
         reply = self.reader.readline(FRAME_LIMIT + 1)
-        if len(reply) > FRAME_LIMIT or not reply.endswith(b"\n"):
-            raise ConnectionError("incomplete or oversized gateway reply")
+        if len(reply) > FRAME_LIMIT:
+            raise ValueError("oversized gateway reply")
+        if not reply.endswith(b"\n"):
+            raise ConnectionError("incomplete gateway reply")
         message = json.loads(reply)
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
             raise ValueError("gateway returned an invalid JSON-RPC envelope")
@@ -63,6 +65,41 @@ class Gateway:
                 raise ValueError("malformed JSON-RPC error")
             raise RpcError(error)
         return message["result"]
+
+
+class GatewaySession:
+    """Reconnect once for a read that lost its response. A submission is only sent once."""
+    def __init__(self, path, timeout):
+        self.path = path
+        self.timeout = timeout
+        self.resources = ExitStack()
+        self.rpc = None
+
+    def open(self):
+        with ExitStack() as pending:
+            stream = pending.enter_context(closing(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)))
+            stream.settimeout(self.timeout)
+            stream.connect(str(self.path))
+            reader = pending.enter_context(stream.makefile("rb"))
+            self.rpc = Gateway(stream, reader)
+            self.resources = pending.pop_all()
+
+    def close(self):
+        self.rpc = None
+        self.resources.close()
+
+    def call(self, method, params):
+        attempts = 2 if method == "getMiningInfo" else 1
+        for attempt in range(attempts):
+            try:
+                if self.rpc is None:
+                    self.open()
+                return self.rpc.call(method, params)
+            except (ConnectionError, TimeoutError, FileNotFoundError):
+                self.close()
+                if attempt + 1 == attempts:
+                    raise
+                time.sleep(min(0.2, self.timeout))
 
 
 def decode_header(value, length):
@@ -294,11 +331,9 @@ def connect(args):
         raise ValueError("the supplied native verifier lacks the V4 interface")
     args.work_dir = args.work_dir.resolve()
     args.work_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with closing(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as stream:
-        stream.settimeout(args.rpc_timeout)
-        stream.connect(str(args.socket))
-        with stream.makefile("rb") as reader:
-            return run(args, Gateway(stream, reader), miner)
+    with closing(GatewaySession(args.socket, args.rpc_timeout)) as session:
+        session.open()
+        return run(args, session, miner)
 
 
 if __name__ == "__main__":

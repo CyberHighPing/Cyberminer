@@ -73,6 +73,9 @@ public:
     std::size_t admission_available(std::size_t raw, std::size_t total) const {
         return raw + (total>raw ? std::min(bytes_,total-raw) : 0);
     }
+    std::size_t admission_available(int device,std::size_t raw,std::size_t total) const {
+        return shape_ && shape_->device==device ? admission_available(raw,total) : raw;
+    }
     Meter previous_idle_release() {
         const Meter prev=deferred_;
         deferred_={};

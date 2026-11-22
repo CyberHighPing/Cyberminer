@@ -39,10 +39,16 @@ class HashrateTest(unittest.TestCase):
                     return None, 0, None
 
                 out, err = io.StringIO(), io.StringIO()
-                flags = ["bench", "--jobs", "2"] + (["--no-status"] if quiet else [])
-                with patch.object(fp8miner, "BUILD", root), patch("time.perf_counter", clock), \
-                        patch.object(fp8miner, "scanner_session", return_value=nullcontext()), \
-                        patch.object(fp8miner, "scan_plan", side_effect=scan), redirect_stdout(out), redirect_stderr(err):
+                flags = ["bench", "--preset", "testnet2", "--jobs", "2"] + (["--no-status"] if quiet else [])
+                with (
+                    patch.object(fp8miner, "BUILD", root),
+                    patch("fp8miner.subprocess.check_output", return_value="throughput 1536"),
+                    patch("time.perf_counter", clock),
+                    patch.object(fp8miner, "scanner_session", return_value=nullcontext()),
+                    patch.object(fp8miner, "scan_plan", side_effect=scan),
+                    redirect_stdout(out),
+                    redirect_stderr(err),
+                ):
                     self.assertEqual(fp8miner.main(flags), 0)
                 result = json.loads(out.getvalue())
                 self.assertEqual(result["wall_seconds"], 8)
